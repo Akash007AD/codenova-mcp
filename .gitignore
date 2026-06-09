@@ -1,0 +1,59 @@
+# ================================================
+# CodeNova MCP — .gitignore
+# ================================================
+
+# Environment — NEVER commit this
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+venv/
+env/
+ENV/
+.venv/
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+
+# Docker
+*.dockerignore
+
+# MongoDB / Redis local data (if ever run outside Docker)
+data/
+dump/
+
+# Logs
+logs/
+*.log
+uvicorn.log
+
+# Temp files
+*.tmp
+*.bak
+tmp/
