@@ -818,6 +818,16 @@ def mcp_analyze_profile(github_username: str) -> dict:
 
 
 # ================================================
+# MOUNT FastMCP onto FastAPI  (FastMCP 3.x)
+# ================================================
+# In FastMCP 3.x, mount the MCP ASGI app under /mcp
+# This exposes SSE at  GET  /mcp/sse
+# and messages at     POST /mcp/messages
+mcp_asgi = mcp.http_app(path="/", transport="sse")
+app.mount("/mcp", mcp_asgi)
+
+
+# ================================================
 # ENTRY POINT
 # ================================================
 

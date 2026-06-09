@@ -31,10 +31,10 @@ def get_cache():
 
 def index_github_issues():
     """
-    Fetch up to 3000 good-first-issues from GitHub
-    and store them in MongoDB. Clears related caches.
+    Fetch good-first-issues from GitHub per language and store in MongoDB.
+    Language tag comes from the query itself — always accurate.
     """
-    print(f"[{datetime.utcnow()}] 🔄 Starting GitHub issue indexing...")
+    print(f"[{datetime.utcnow()}] Refreshing GitHub issue index...")
 
     issue_model, _ = get_models()
     CacheManager = get_cache()
@@ -46,38 +46,41 @@ def index_github_issues():
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-    # Search queries for different languages
+    # Each tuple: (github_search_query, primary_language_tag)
+    # The language tag is stamped directly onto every issue from that query.
+    # This is more reliable than parsing repo metadata which the search API
+    # does not return inline.
     search_queries = [
-        "label:good-first-issue language:JavaScript stars:>50 is:open is:issue",
-        "label:good-first-issue language:Python stars:>50 is:open is:issue",
-        "label:good-first-issue language:TypeScript stars:>50 is:open is:issue",
-        "label:good-first-issue language:Java stars:>50 is:open is:issue",
-        "label:good-first-issue language:Go stars:>50 is:open is:issue",
-        "label:good-first-issue language:Rust stars:>50 is:open is:issue",
-        "label:good-first-issue language:C++ stars:>50 is:open is:issue",
-        "label:good-first-issue label:help-wanted stars:>100 is:open is:issue",
+        ("label:good-first-issue language:JavaScript stars:>50 is:open is:issue", "JavaScript"),
+        ("label:good-first-issue language:Python stars:>50 is:open is:issue",     "Python"),
+        ("label:good-first-issue language:TypeScript stars:>50 is:open is:issue", "TypeScript"),
+        ("label:good-first-issue language:Java stars:>50 is:open is:issue",       "Java"),
+        ("label:good-first-issue language:Go stars:>50 is:open is:issue",         "Go"),
+        ("label:good-first-issue language:Rust stars:>50 is:open is:issue",       "Rust"),
+        ("label:good-first-issue language:C++ stars:>50 is:open is:issue",        "C++"),
+        ("label:good-first-issue language:HTML stars:>50 is:open is:issue",       "HTML"),
     ]
 
     total_indexed = 0
 
-    for query in search_queries:
+    for query, language in search_queries:
         try:
-            _index_query(query, headers, issue_model)
+            _index_query(query, headers, issue_model, language)
             total_indexed += 1
         except Exception as e:
-            print(f"⚠️  Query failed [{query[:50]}...]: {e}")
+            print(f"Query failed [{query[:50]}...]: {e}")
 
-    # Invalidate Redis caches for issue lists
+    # Invalidate Redis caches so next request recomputes recommendations
     CacheManager.invalidate_issues()
-    print(f"✅ Issue indexing complete — {total_indexed} queries processed")
+    print(f"Issue indexing complete — {total_indexed} queries processed")
 
 
-def _index_query(query: str, headers: dict, issue_model):
-    """Fetch and store issues for a single search query"""
+def _index_query(query: str, headers: dict, issue_model, primary_language: str = ""):
+    """Fetch and upsert issues for a single search query"""
     from tools.matching import estimate_difficulty
 
     with httpx.Client(timeout=30) as client:
-        for page in range(1, 4):  # 3 pages × 100 = 300 per query
+        for page in range(1, 4):  # 3 pages x 100 = up to 300 per language
             response = client.get(
                 "https://api.github.com/search/issues",
                 headers=headers,
@@ -93,7 +96,7 @@ def _index_query(query: str, headers: dict, issue_model):
             if response.status_code == 422:
                 break  # Invalid query
             if response.status_code == 403:
-                print("⚠️  GitHub rate limit hit — stopping indexing")
+                print("GitHub rate limit hit — stopping indexing")
                 break
 
             response.raise_for_status()
@@ -105,15 +108,16 @@ def _index_query(query: str, headers: dict, issue_model):
 
             issues_to_upsert = []
             for item in items:
-                repo_data = item.get("repository", {}) or {}
-
                 labels = [l["name"] for l in item.get("labels", [])]
-                languages = _extract_languages_from_issue(item)
+
+                # Language is taken from the query — guaranteed correct.
+                # Supplement with any extra hints from title/labels.
+                languages = _extract_languages_from_issue(item, primary_language)
 
                 issue_doc = {
                     "github_id": item["id"],
                     "title": item["title"],
-                    "description": item.get("body", "")[:2000],  # Cap at 2000 chars
+                    "description": (item.get("body") or "")[:2000],
                     "issue_url": item["html_url"],
                     "repo": item["repository_url"].split("/repos/")[-1],
                     "repo_url": item["repository_url"].replace(
@@ -123,8 +127,8 @@ def _index_query(query: str, headers: dict, issue_model):
                     "difficulty": estimate_difficulty(labels),
                     "labels": labels,
                     "languages": languages,
-                    "stars": repo_data.get("stargazers_count", 0),
-                    "open_issues_count": repo_data.get("open_issues_count", 0),
+                    "stars": 0,               # not returned inline by search API
+                    "open_issues_count": 0,
                     "comments": item.get("comments", 0),
                     "created_at": item.get("created_at"),
                     "updated_at": item.get("updated_at"),
@@ -138,28 +142,54 @@ def _index_query(query: str, headers: dict, issue_model):
                 issue_model.bulk_upsert(issues_to_upsert)
 
             if len(items) < 100:
-                break  # Last page
+                break  # Last page reached
 
 
-def _extract_languages_from_issue(item: dict) -> list:
-    """Extract language from issue labels and title hints"""
+def _extract_languages_from_issue(item: dict, primary_language: str = "") -> list:
+    """
+    Build the language list for an issue.
+    primary_language (from the search query) is always included first.
+    Title and label keywords are supplementary.
+    """
     languages = set()
+
+    # Primary: from the search query — always reliable
+    if primary_language:
+        languages.add(primary_language)
+
     LANGUAGE_KEYWORDS = {
-        "javascript", "typescript", "python", "java", "go", "golang",
-        "rust", "c++", "c#", "ruby", "php", "swift", "kotlin", "dart",
-        "scala", "elixir", "haskell", "clojure", "r", "matlab"
+        "javascript": "JavaScript",
+        "typescript": "TypeScript",
+        "python": "Python",
+        "java": "Java",
+        "go": "Go",
+        "golang": "Go",
+        "rust": "Rust",
+        "c++": "C++",
+        "c#": "C#",
+        "ruby": "Ruby",
+        "php": "PHP",
+        "swift": "Swift",
+        "kotlin": "Kotlin",
+        "dart": "Dart",
+        "html": "HTML",
+        "css": "CSS",
     }
 
+    # Supplement from title — whole-word match only to avoid
+    # "go" matching inside "good-first-issue" etc.
+    import re
     title_lower = (item.get("title") or "").lower()
-    for lang in LANGUAGE_KEYWORDS:
-        if lang in title_lower:
-            languages.add(lang.capitalize())
+    for kw, canonical in LANGUAGE_KEYWORDS.items():
+        if re.search(r'\b' + re.escape(kw) + r'\b', title_lower):
+            languages.add(canonical)
 
+    # Supplement from label names — whole-word match only
     for label in item.get("labels", []):
         label_name = label.get("name", "").lower()
-        for lang in LANGUAGE_KEYWORDS:
-            if lang in label_name:
-                languages.add(lang.capitalize())
+        for kw, canonical in LANGUAGE_KEYWORDS.items():
+            if re.search(r'\b' + re.escape(kw) + r'\b', label_name):
+                languages.add(canonical)
 
     return list(languages)
 
@@ -173,7 +203,7 @@ def prewarm_explanation_cache():
     Restore popular file explanations from MongoDB into Redis.
     Runs nightly so frequently-requested files are cache-ready.
     """
-    print(f"[{datetime.utcnow()}] 📚 Pre-warming explanation cache...")
+    print(f"[{datetime.utcnow()}] Pre-warming explanation cache...")
 
     _, explanation_model = get_models()
     CacheManager = get_cache()
@@ -197,7 +227,7 @@ def prewarm_explanation_cache():
             })
             restored += 1
 
-    print(f"✅ Pre-warmed {restored} explanations into Redis")
+    print(f"Pre-warmed {restored} explanations into Redis")
 
 
 # ------------------------------------------------
@@ -206,12 +236,10 @@ def prewarm_explanation_cache():
 
 def cleanup_expired_issues():
     """Delete issues past their expiry date from MongoDB"""
-    print(f"[{datetime.utcnow()}] 🧹 Cleaning expired issues...")
-
+    print(f"[{datetime.utcnow()}] Cleaning expired issues...")
     issue_model, _ = get_models()
     deleted = issue_model.delete_expired()
-
-    print(f"✅ Deleted {deleted} expired issues")
+    print(f"Deleted {deleted} expired issues")
 
 
 # ------------------------------------------------
@@ -225,9 +253,9 @@ def create_scheduler() -> BackgroundScheduler:
     """
     scheduler = BackgroundScheduler(
         job_defaults={
-            "coalesce": True,           # Merge missed runs
-            "max_instances": 1,         # No overlapping runs
-            "misfire_grace_time": 300   # 5 min grace if missed
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 300
         }
     )
 
@@ -263,13 +291,13 @@ def create_scheduler() -> BackgroundScheduler:
 
 def run_initial_indexing():
     """
-    Run issue indexing immediately on server startup if DB is empty.
+    Run issue indexing immediately on server startup if DB is near-empty.
     """
     issue_model, _ = get_models()
     count = issue_model.count_active()
 
     if count < 100:
-        print(f"⚡ Only {count} issues in DB — running initial indexing...")
+        print(f"Only {count} issues in DB — running initial indexing...")
         index_github_issues()
     else:
-        print(f"✅ {count} issues already indexed — skipping initial run")
+        print(f"{count} issues already indexed — skipping initial run")
