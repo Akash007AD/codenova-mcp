@@ -196,7 +196,7 @@ def extract_skills_from_repos(repos: list) -> dict:
     """
     total = len(repos)
     if total == 0:
-        return {}
+        return {},[]
 
     language_counts = {}
     topic_set = set()
