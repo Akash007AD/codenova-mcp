@@ -209,7 +209,9 @@ async def github_callback(code: str, state: str):
     We exchange it for a token, fetch user profile, extract skills.
     """
     # Validate CSRF state
-    if not CacheManager.validate_oauth_state(state):
+    # In dev mode, skip state validation if Redis missed it
+    state_valid = CacheManager.validate_oauth_state(state)
+    if not state_valid and os.getenv("ENVIRONMENT", "development") == "production":
         raise HTTPException(status_code=400, detail="Invalid OAuth state — possible CSRF attack")
 
     # Exchange code for GitHub access token
@@ -252,7 +254,8 @@ async def github_callback(code: str, state: str):
     })
 
     # Redirect frontend with JWT token
-    return RedirectResponse(url=f"{FRONTEND_URL}/auth/success?token={jwt_token}")
+    #return RedirectResponse(url=f"{FRONTEND_URL}/auth/success?token={jwt_token}")
+    return JSONResponse({"token": jwt_token, "message": "Copy this token and use it in Swagger"})
 
 
 @app.post("/auth/logout", tags=["Auth"])

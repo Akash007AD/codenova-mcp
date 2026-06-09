@@ -66,7 +66,8 @@ class CacheManager:
                 password=password if password else None,
                 decode_responses=True,
                 socket_connect_timeout=5,
-                socket_timeout=5
+                socket_timeout=5,
+                protocol=2
             )
 
             try:
