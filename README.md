@@ -4,6 +4,8 @@
 
 CodeNova matches developers to GitHub issues that fit their skill level, explains unfamiliar codebases in plain English, and tracks their learning progress over time. Built as a **FastMCP + FastAPI** server with **GitHub OAuth**, **MongoDB**, **Redis caching**, and **background job scheduling**.
 
+🚀 **Live Server:** `https://codenova-mcp.onrender.com`
+
 ---
 
 ## Features
@@ -62,7 +64,209 @@ codenova-mcp/
 
 ---
 
-## Quick Start
+## Using the Live Server (No Setup Required)
+
+The server is already deployed at `https://codenova-mcp.onrender.com`. You can use it immediately without cloning or running anything locally.
+
+### Step 1 — Get your JWT token
+
+Open this URL in your browser and authorise with GitHub:
+
+```
+https://codenova-mcp.onrender.com/auth/github/login
+```
+
+You will receive a JSON response like:
+
+```json
+{
+  "token": "eyJhbGci...",
+  "message": "Copy this token and use it in Swagger"
+}
+```
+
+Copy the token value — you will use it in all API calls below.
+
+### Step 2 — Test the API (Windows Command Prompt)
+
+```cmd
+:: Save your token
+set TOKEN=<paste your token here>
+
+:: 1. Health check (no auth needed)
+curl https://codenova-mcp.onrender.com/health
+
+:: 2. Issue stats (no auth needed)
+curl https://codenova-mcp.onrender.com/api/issues/stats
+
+:: 3. Your profile
+curl https://codenova-mcp.onrender.com/api/profile -H "Authorization: Bearer %TOKEN%"
+
+:: 4. Progress dashboard
+curl https://codenova-mcp.onrender.com/api/progress -H "Authorization: Bearer %TOKEN%"
+
+:: 5. Get 5 beginner issue recommendations
+curl -X POST https://codenova-mcp.onrender.com/api/issues/recommend ^
+  -H "Authorization: Bearer %TOKEN%" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"difficulty\":\"beginner\",\"count\":5}"
+
+:: 6. Contribution history
+curl https://codenova-mcp.onrender.com/api/contributions/history -H "Authorization: Bearer %TOKEN%"
+```
+
+### Step 2 — Test the API (macOS / Linux / Git Bash)
+
+```bash
+# Save your token
+export TOKEN=<paste your token here>
+
+# 1. Health check (no auth needed)
+curl https://codenova-mcp.onrender.com/health
+
+# 2. Issue stats (no auth needed)
+curl https://codenova-mcp.onrender.com/api/issues/stats
+
+# 3. Your profile
+curl https://codenova-mcp.onrender.com/api/profile -H "Authorization: Bearer $TOKEN"
+
+# 4. Progress dashboard
+curl https://codenova-mcp.onrender.com/api/progress -H "Authorization: Bearer $TOKEN"
+
+# 5. Get 5 beginner issue recommendations
+curl -X POST https://codenova-mcp.onrender.com/api/issues/recommend \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"difficulty":"beginner","count":5}'
+
+# 6. Contribution history
+curl https://codenova-mcp.onrender.com/api/contributions/history -H "Authorization: Bearer $TOKEN"
+```
+
+### Step 3 — Explore in Swagger UI
+
+Visit `https://codenova-mcp.onrender.com/docs`, click **Authorize**, and paste your JWT token to test all endpoints interactively.
+
+---
+
+## Using as a Remote MCP Server in Claude Desktop
+
+CodeNova exposes MCP tools over SSE at `https://codenova-mcp.onrender.com/mcp/sse`. You can connect Claude Desktop to the live server without running anything locally.
+
+### Prerequisites
+
+Install Node.js 18+ from [nodejs.org](https://nodejs.org) — required for `mcp-remote`.
+
+### Step 1 — Find your config file
+
+| OS | Config file location |
+|----|---------------------|
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+
+Open the file in any text editor (Notepad, VS Code, etc.).
+
+### Step 2 — Paste the full config
+
+**If the file is empty or does not exist yet**, paste this entire block and save:
+
+```json
+{
+  "mcpServers": {
+    "codenova": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://codenova-mcp.onrender.com/mcp/sse"
+      ]
+    }
+  }
+}
+```
+
+**If the file already has other MCP servers**, add only the `"codenova"` entry inside the existing `"mcpServers"` object:
+
+```json
+{
+  "mcpServers": {
+    "some-other-server": {
+      "command": "npx",
+      "args": ["some-other-package"]
+    },
+    "codenova": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://codenova-mcp.onrender.com/mcp/sse"
+      ]
+    }
+  }
+}
+```
+
+### Step 3 — Restart Claude Desktop
+
+Close and reopen Claude Desktop. CodeNova will appear in your connected tools list. On first run, `mcp-remote` downloads automatically via npx — no separate install needed.
+
+---
+
+### Option B — Local stdio (Run the server yourself)
+
+If you prefer to run your own instance, first complete the Quick Start (Self-Hosted) steps below, then open `claude_desktop_config.json` and paste:
+
+**Windows** (paste the full file):
+
+```json
+{
+  "mcpServers": {
+    "codenova-local": {
+      "command": "python",
+      "args": ["D:\\Open Source Contribution\\codenova-mcp\\mcp_stdio.py"],
+      "env": {
+        "PYTHONPATH": "D:\\Open Source Contribution\\codenova-mcp"
+      }
+    }
+  }
+}
+```
+
+**macOS / Linux** (paste the full file):
+
+```json
+{
+  "mcpServers": {
+    "codenova-local": {
+      "command": "python",
+      "args": ["/path/to/codenova-mcp/mcp_stdio.py"],
+      "env": {
+        "PYTHONPATH": "/path/to/codenova-mcp"
+      }
+    }
+  }
+}
+```
+
+Replace the path with the actual location where you cloned the repo, then restart Claude Desktop.
+
+### Available MCP Tools
+
+Once connected, Claude can call these tools directly in conversation:
+
+| Tool | What you can ask Claude |
+|------|------------------------|
+| `mcp_get_recommendations` | *"Find me beginner Python issues to contribute to"* |
+| `mcp_get_user_progress` | *"Show my contribution streak and XP"* |
+| `mcp_analyze_profile` | *"Analyse the GitHub profile for username X"* |
+
+**Example conversation:**
+
+> You: *"I want to start contributing to open source. Find me 5 beginner issues that match my skills."*
+>
+> Claude calls `mcp_get_recommendations` → returns personalised GitHub issues with match scores, difficulty labels, and direct links.
+
+---
+
+## Quick Start (Self-Hosted)
 
 ### Prerequisites
 
@@ -72,11 +276,12 @@ codenova-mcp/
 ### 1. Clone and set up
 
 ```bash
-cd "D:\Open Source Contribution\codenova-mcp"
+git clone https://github.com/Akash007AD/codenova-mcp.git
+cd codenova-mcp
 
 python -m venv venv
 venv\Scripts\activate          # Windows CMD
-# venv\Scripts\Activate.ps1   # Windows PowerShell
+# source venv/bin/activate     # macOS / Linux
 
 pip install -r requirements.txt
 ```
@@ -84,7 +289,8 @@ pip install -r requirements.txt
 ### 2. Configure environment
 
 ```bash
-copy .env.example .env
+copy .env.example .env         # Windows
+# cp .env.example .env         # macOS / Linux
 ```
 
 Generate secrets:
@@ -265,7 +471,7 @@ docker-compose down -v
 | `ANTHROPIC_API_KEY` | Optional | — | Claude API key (if switching to Option B) |
 | `GITHUB_CLIENT_ID` | ✅ | — | GitHub OAuth App client ID |
 | `GITHUB_CLIENT_SECRET` | ✅ | — | GitHub OAuth App secret |
-| `GITHUB_CALLBACK_URL` | ✅ | `http://localhost:8000/auth/github/callback` | Must match GitHub App settings |
+| `GITHUB_CALLBACK_URL` | ✅ | `http://localhost:8000/auth/github/callback` | Must match GitHub App settings exactly |
 | `GITHUB_TOKEN` | ✅ | — | Personal access token for background indexing |
 | `MONGODB_URI` | ✅ | `mongodb://root:password@localhost:27017/codenova?authSource=admin` | MongoDB connection string |
 | `REDIS_URL` | ✅ | `redis://localhost:6379` | Redis connection string |
@@ -287,6 +493,20 @@ The server exposes three FastMCP tools that Claude can call directly:
 | `mcp_get_recommendations` | Get issue recommendations for a user ID |
 | `mcp_get_user_progress` | Get contributions, streak, XP, skills |
 | `mcp_analyze_profile` | Look up a GitHub username's stored profile |
+
+---
+
+## Deploying to Render
+
+The repo includes a `render.yaml` for one-click deploys.
+
+1. Push the repo to GitHub
+2. Go to [render.com](https://render.com) → New Web Service → connect your repo
+3. Render auto-detects `render.yaml` and configures the service
+4. Add all required environment variables in the Render dashboard (see table above)
+5. Set `GITHUB_CALLBACK_URL` to `https://<your-render-url>/auth/github/callback`
+6. Set `FRONTEND_URL` to `https://<your-render-url>`
+7. Update your GitHub OAuth App's callback URL to match
 
 ---
 
