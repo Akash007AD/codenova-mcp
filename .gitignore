@@ -44,7 +44,7 @@ Thumbs.db
 # Docker
 *.dockerignore
 
-# MongoDB / Redis local data (if ever run outside Docker)
+# MongoDB / Redis local data
 data/
 dump/
 

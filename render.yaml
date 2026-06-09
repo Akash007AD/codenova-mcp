@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: codenova-mcp
+    runtime: python
+    region: singapore       # closest to India
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "False"
+      # ── Set these manually in Render dashboard ──
+      # MONGODB_URI
+      # REDIS_URL
+      # GROQ_API_KEY
+      # GITHUB_CLIENT_ID
+      # GITHUB_CLIENT_SECRET
+      # GITHUB_CALLBACK_URL   (must be https://codenova-mcp.onrender.com/auth/github/callback)
+      # GITHUB_TOKEN
+      # JWT_SECRET
+      # ENCRYPTION_KEY
+      # FRONTEND_URL          (your frontend URL or https://codenova-mcp.onrender.com)

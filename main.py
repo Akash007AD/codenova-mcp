@@ -726,6 +726,18 @@ async def get_progress(current_user: dict = Depends(get_current_user)):
 # HEALTH + ADMIN ROUTES
 # ================================================
 
+@app.get("/", tags=["Health"])
+async def root():
+    """Root endpoint — confirms server is running"""
+    return {
+        "service": "CodeNova MCP Server",
+        "status": "running",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Check status of all services"""
