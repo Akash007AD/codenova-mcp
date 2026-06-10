@@ -14,14 +14,22 @@ services:
         value: production
       - key: DEBUG
         value: "False"
-      # ── Set these manually in Render dashboard ──
+      # ── Set these manually in Render dashboard ──────────────────────────
       # MONGODB_URI
       # REDIS_URL
       # GROQ_API_KEY
       # GITHUB_CLIENT_ID
       # GITHUB_CLIENT_SECRET
-      # GITHUB_CALLBACK_URL   (must be https://codenova-mcp.onrender.com/auth/github/callback)
+      # GITHUB_CALLBACK_URL   = https://codenova-mcp.onrender.com/auth/github/callback
       # GITHUB_TOKEN
       # JWT_SECRET
       # ENCRYPTION_KEY
-      # FRONTEND_URL          (your frontend URL or https://codenova-mcp.onrender.com)
+      #
+      # FRONTEND_URL          ← THIS IS THE KEY ONE.
+      #                         Set to your deployed frontend URL, e.g.:
+      #                           https://codenova-frontend.onrender.com
+      #                         or for local dev testing:
+      #                           http://localhost:3000
+      #
+      #                         After OAuth, the backend redirects to:
+      #                           {FRONTEND_URL}/auth/callback?token=...

@@ -76,7 +76,8 @@ def verify_jwt(token: str) -> dict:
 
 def get_github_oauth_url(state: str) -> str:
     """Build GitHub OAuth authorization URL"""
-    scopes = "read:user,user:email,repo"
+    # Only public data — never request private repo access
+    scopes = "read:user,user:email,public_repo"
     return (
         f"https://github.com/login/oauth/authorize"
         f"?client_id={GITHUB_CLIENT_ID}"
@@ -120,7 +121,7 @@ async def fetch_github_user(access_token: str) -> dict:
         return response.json()
 
 async def fetch_github_repos(access_token: str, per_page: int = 100) -> list:
-    """Fetch all public repos for skill analysis"""
+    """Fetch only public repos for skill analysis — never private repos"""
     repos = []
     page = 1
 
@@ -136,7 +137,8 @@ async def fetch_github_repos(access_token: str, per_page: int = 100) -> list:
                     "per_page": per_page,
                     "page": page,
                     "sort": "updated",
-                    "type": "owner"
+                    "type": "owner",
+                    "visibility": "public"    # ← public only, never private
                 }
             )
 
@@ -147,7 +149,9 @@ async def fetch_github_repos(access_token: str, per_page: int = 100) -> list:
             if not page_data:
                 break
 
-            repos.extend(page_data)
+            # Extra guard: drop any repo that GitHub still marks private
+            public_only = [r for r in page_data if not r.get("private", False)]
+            repos.extend(public_only)
             page += 1
 
             if len(page_data) < per_page:

@@ -206,7 +206,8 @@ async def github_login():
 async def github_callback(code: str, state: str):
     """
     Step 2: GitHub redirects here with auth code.
-    We exchange it for a token, fetch user profile, extract skills.
+    We exchange it for a token, fetch user profile, extract skills,
+    then redirect the browser to the frontend with the JWT in the URL.
     """
     # Validate CSRF state
     # In dev mode, skip state validation if Redis missed it
@@ -253,9 +254,9 @@ async def github_callback(code: str, state: str):
         "streak": user.get("streak", 0)
     })
 
-    # Redirect frontend with JWT token
-    #return RedirectResponse(url=f"{FRONTEND_URL}/auth/success?token={jwt_token}")
-    return JSONResponse({"token": jwt_token, "message": "Copy this token and use it in Swagger"})
+    # ── Redirect browser to frontend with JWT in query string ──
+    # Frontend's /auth/callback page picks it up and saves to localStorage.
+    return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?token={jwt_token}")
 
 
 @app.post("/auth/logout", tags=["Auth"])
