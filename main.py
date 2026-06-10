@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse
 # ── Import the shared MCP instance (tools already registered) ────────
 # server.py handles all tool definitions, auth, DB/Redis init.
 # We just need the mcp object to mount it over SSE here.
-from server import mcp, GITHUB_USERNAME, GITHUB_TOKEN, GROQ_API_KEY, _db
+from server import mcp, SERVER_SECRET, GROQ_API_KEY, _db
 
 # =====================================================
 # FastAPI app
@@ -64,8 +64,8 @@ async def health():
     return JSONResponse({
         "status":           "ok",
         "service":          "codenova-mcp",
-        "owner":            GITHUB_USERNAME or "NOT_SET",
-        "github_token":     "set" if GITHUB_TOKEN else "MISSING",
+        "mode":             "multi-user (github_token per call)",
+        "server_secret":    "set" if SERVER_SECRET else "NOT SET (open access — set SERVER_SECRET in env)",
         "groq":             "set" if GROQ_API_KEY else "not set (AI explanations disabled)",
         "mongodb":          "connected" if db_ok else "unavailable",
         "mcp_endpoint":     "/sse",
