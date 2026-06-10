@@ -42,7 +42,12 @@ import re
 import secrets as _secrets
 from datetime import datetime
 from fastmcp import FastMCP
+from contextvars import ContextVar
 
+_request_github_token: ContextVar[str] = ContextVar("_request_github_token", default="")
+
+def _get_token_from_context() -> str:
+    return _request_github_token.get("")
 # =====================================================
 # SERVER CONFIG  (nothing user-specific here)
 # =====================================================
@@ -336,7 +341,7 @@ async def get_my_profile(github_token: str = "", server_secret: str = "") -> dic
                        Required scopes: read:user, public_repo
         server_secret: The SERVER_SECRET provided by the server operator (auto-loaded from env if set).
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):
@@ -433,7 +438,7 @@ async def recommend_issues(
         difficulty:    'beginner', 'intermediate', 'advanced', or 'auto'
         count:         Number of issues to return (max 20)
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):
@@ -525,7 +530,7 @@ async def get_issue_details(
         github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
         server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):
@@ -615,7 +620,7 @@ async def explain_code_file(
         server_secret:  The SERVER_SECRET from the server operator (auto-loaded from env if set).
         issue_context:  Optional issue title for a more focused explanation.
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):
@@ -708,7 +713,7 @@ async def get_repo_details(
         github_token:   Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
         server_secret:  The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):
@@ -809,7 +814,7 @@ async def find_issues(
         count:         Results to return (max 30)
         min_stars:     Minimum repo stars
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):
@@ -882,7 +887,7 @@ async def search_repos(
         min_stars:     Minimum star count
         count:         Results to return (max 20)
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):
@@ -943,7 +948,7 @@ async def check_rate_limit(
         github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
         server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
-    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
     server_secret = server_secret or os.getenv("SERVER_SECRET", "")
 
     if not _check_server_secret(server_secret):

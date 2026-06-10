@@ -29,11 +29,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 # ── Import the shared MCP instance (tools already registered) ────────
-# server.py handles all tool definitions, auth, DB/Redis init.
-# We just need the mcp object to mount it over SSE here.
-from server import mcp, SERVER_SECRET, GROQ_API_KEY, _db
+from server import mcp, SERVER_SECRET, GROQ_API_KEY, _db, _request_github_token
 
 # =====================================================
 # FastAPI app
@@ -43,12 +43,27 @@ app = FastAPI(
     title="CodeNova MCP",
     description="AI-powered open-source contribution mentor — MCP over SSE",
     version="2.0.0",
-    docs_url=None,   # no swagger UI on prod
+    docs_url=None,
     redoc_url=None,
 )
 
 # =====================================================
-# Health check  (Render uses this to confirm liveness)
+# Token Middleware
+# Reads ?github_token= from the SSE URL and stores it
+# in the context var so all tools can access it.
+# =====================================================
+
+class TokenMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        token = request.query_params.get("github_token", "")
+        if token:
+            _request_github_token.set(token)
+        return await call_next(request)
+
+app.add_middleware(TokenMiddleware)
+
+# =====================================================
+# Health check
 # =====================================================
 
 @app.get("/health")
@@ -84,15 +99,10 @@ async def root():
 
 # =====================================================
 # Mount MCP over SSE
-# FastMCP 2.x: http_app(path, transport)
-# This exposes:
-#   GET  /sse          ← SSE stream (Claude connects here)
-#   POST /messages     ← tool call messages
 # =====================================================
 
 mcp_asgi = mcp.http_app(path="/", transport="sse")
 app.mount("/", mcp_asgi)
-
 
 # =====================================================
 # Local dev runner
