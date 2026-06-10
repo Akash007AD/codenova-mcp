@@ -25,6 +25,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 import httpx
 import re
+import time
 from datetime import datetime
 from fastmcp import FastMCP
 
@@ -67,6 +68,79 @@ except Exception as _e:
     sys.stderr.write(f"[codenova] Redis unavailable (request caching off): {_e}\n")
 
 # =====================================================
+# IN-MEMORY FALLBACK CACHE
+# Used when Redis is unavailable to prevent hammering
+# the GitHub Search API (30 req/min limit).
+# Stores: { key -> {"value": ..., "expires_at": float} }
+# =====================================================
+
+_mem_cache: dict = {}
+
+def _mem_get(key: str):
+    """Get from in-memory cache. Returns None on miss or expiry."""
+    entry = _mem_cache.get(key)
+    if not entry:
+        return None
+    if time.monotonic() > entry["expires_at"]:
+        del _mem_cache[key]
+        return None
+    return entry["value"]
+
+def _mem_set(key: str, value, ttl: int):
+    """Store in in-memory cache with TTL (seconds)."""
+    _mem_cache[key] = {"value": value, "expires_at": time.monotonic() + ttl}
+
+def _mem_delete(key: str):
+    _mem_cache.pop(key, None)
+
+def _mem_delete_prefix(prefix: str):
+    to_del = [k for k in _mem_cache if k.startswith(prefix)]
+    for k in to_del:
+        del _mem_cache[k]
+
+# =====================================================
+# UNIFIED CACHE HELPERS
+# Try Redis first; fall back to in-memory.
+# =====================================================
+
+def _cache_get(key: str):
+    """Read from Redis if available, else in-memory fallback."""
+    if _cache:
+        try:
+            val = _cache.get(key)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return _mem_get(key)
+
+def _cache_set(key: str, value, ttl: int = 1800):
+    """Write to Redis if available AND in-memory (dual-write for resilience)."""
+    if _cache:
+        try:
+            _cache.set(key, value, ttl)
+        except Exception:
+            pass
+    # Always write to memory so we have a local fallback
+    _mem_set(key, value, ttl)
+
+def _cache_delete(key: str):
+    if _cache:
+        try:
+            _cache.delete(key)
+        except Exception:
+            pass
+    _mem_delete(key)
+
+def _cache_delete_prefix(prefix: str):
+    if _cache:
+        try:
+            _cache.delete_pattern(f"{prefix}*")
+        except Exception:
+            pass
+    _mem_delete_prefix(prefix)
+
+# =====================================================
 # FastMCP instance
 # =====================================================
 
@@ -95,14 +169,13 @@ def _gh_headers() -> dict:
 async def _resolve_user() -> dict | None:
     """
     Resolve the current user from GITHUB_TOKEN.
-    Cached in Redis for 5 minutes to avoid hammering the GitHub API.
+    Cached for 5 minutes to avoid hammering the GitHub API.
     """
     short_key = f"codenova:whoami:{GITHUB_TOKEN[:16]}"
 
-    if _cache:
-        cached = _cache.get(short_key)
-        if cached and isinstance(cached, dict) and "id" in cached:
-            return cached
+    cached = _cache_get(short_key)
+    if cached and isinstance(cached, dict) and "id" in cached:
+        return cached
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -129,9 +202,7 @@ async def _resolve_user() -> dict | None:
         "followers":    user.get("followers", 0),
     }
 
-    if _cache:
-        _cache.set(short_key, result, 300)
-
+    _cache_set(short_key, result, 300)
     return result
 
 
@@ -294,6 +365,84 @@ _BAD_TOKEN = {
     ),
 }
 
+# TTL for search result caches (seconds)
+_TTL_ISSUES = 60 * 60       # 1 hour — issues don't change that fast
+_TTL_RECS   = 60 * 60       # 1 hour
+
+
+# =====================================================
+# INTERNAL SEARCH HELPER — rate-limit-aware + cached
+# =====================================================
+
+async def _search_issues_cached(
+    cache_key: str,
+    queries: list[str],       # list of GitHub search query strings
+    lang_tag: list[str],      # parallel list: language label per query
+    ttl: int = _TTL_ISSUES,
+) -> tuple[list, bool]:
+    """
+    Execute one or more GitHub issue searches, with full caching.
+
+    Returns (issues_list, from_cache).
+    If rate-limited and cache is empty, returns ([], False).
+    If rate-limited but stale cache exists, returns (stale_list, True).
+    """
+    # --- Cache read ---
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        sys.stderr.write(f"[codenova] Search cache HIT: {cache_key}\n")
+        return cached, True
+
+    sys.stderr.write(f"[codenova] Search cache MISS: {cache_key} — querying GitHub\n")
+
+    all_issues = []
+    rate_limited = False
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for q, lang in zip(queries, lang_tag):
+            r = await client.get(
+                "https://api.github.com/search/issues",
+                headers=_gh_headers(),
+                params={"q": q, "sort": "updated", "order": "desc", "per_page": 30},
+            )
+            if r.status_code in (403, 429):
+                sys.stderr.write(
+                    f"[codenova] GitHub search rate-limited (HTTP {r.status_code}) "
+                    f"for lang={lang}. Remaining search quota exhausted.\n"
+                )
+                rate_limited = True
+                break
+            if r.status_code != 200:
+                sys.stderr.write(f"[codenova] Search HTTP {r.status_code} for lang={lang}, skipping.\n")
+                continue
+            for item in r.json().get("items", []):
+                labels = [lb["name"] for lb in item.get("labels", [])]
+                all_issues.append({
+                    "title":        item["title"],
+                    "url":          item["html_url"],
+                    "repo":         item["repository_url"].replace("https://api.github.com/repos/", ""),
+                    "repo_url":     item["repository_url"].replace(
+                                        "https://api.github.com/repos/",
+                                        "https://github.com/"),
+                    "language":     lang,
+                    "difficulty":   _estimate_difficulty(labels),
+                    "labels":       labels,
+                    "comments":     item.get("comments", 0),
+                    "updated_at":   item.get("updated_at", "")[:10],
+                    "body_preview": (item.get("body") or "")[:300].strip(),
+                })
+
+    if rate_limited and not all_issues:
+        # Complete miss — nothing fetched before the rate limit hit.
+        # Return empty so callers can surface a clear error.
+        return [], False
+
+    # Cache whatever we managed to get (even partial results from before rate-limit)
+    if all_issues:
+        _cache_set(cache_key, all_issues, ttl)
+
+    return all_issues, False
+
 
 # =====================================================
 # MCP TOOLS
@@ -397,6 +546,7 @@ async def recommend_issues(
 ) -> dict:
     """
     Full pipeline: loads your skills then finds matching open GitHub issues.
+    Results are cached for 1 hour to avoid GitHub Search API rate limits (30 req/min).
     This is the main 'help me contribute' tool.
 
     Args:
@@ -420,36 +570,32 @@ async def recommend_issues(
     if difficulty == "auto":
         difficulty = profile.get("recommended_difficulty", "beginner")
 
-    top_langs = list(skills.keys())[:4] or ["Python", "JavaScript"]
+    top_langs = list(skills.keys())[:2] or ["Python", "JavaScript"]
     label = "good first issue" if difficulty == "beginner" else "help wanted"
 
-    all_issues = []
-    async with httpx.AsyncClient(timeout=30) as client:
-        for lang in top_langs:
-            q = f'label:"{label}" language:{lang} stars:>50 is:open is:issue no:assignee'
-            r = await client.get(
-                "https://api.github.com/search/issues",
-                headers=_gh_headers(),
-                params={"q": q, "sort": "updated", "order": "desc", "per_page": 15},
-            )
-            if r.status_code == 403:
-                return {"error": "GitHub rate limit hit. Wait ~1 minute and try again."}
-            if r.status_code != 200:
-                continue
-            for item in r.json().get("items", []):
-                labels = [lb["name"] for lb in item.get("labels", [])]
-                all_issues.append({
-                    "title":        item["title"],
-                    "url":          item["html_url"],
-                    "repo":         item["repository_url"].replace("https://api.github.com/repos/", ""),
-                    "repo_url":     item["repository_url"].replace("https://api.github.com/repos/", "https://github.com/"),
-                    "language":     lang,
-                    "difficulty":   _estimate_difficulty(labels),
-                    "labels":       labels,
-                    "comments":     item.get("comments", 0),
-                    "updated_at":   item.get("updated_at", "")[:10],
-                    "body_preview": (item.get("body") or "")[:300].strip(),
-                })
+    # Build a stable cache key: user + difficulty + their top languages
+    langs_key  = "_".join(sorted(top_langs))
+    cache_key  = f"codenova:recs:{user['id']}:{difficulty}:{langs_key}"
+
+    queries  = [
+        f'label:"{label}" language:{lang} stars:>50 is:open is:issue no:assignee'
+        for lang in top_langs
+    ]
+    lang_tags = top_langs
+
+    issues, from_cache = await _search_issues_cached(cache_key, queries, lang_tags, ttl=_TTL_RECS)
+
+    if not issues and not from_cache:
+        return {
+            "error": "github_search_rate_limited",
+            "message": (
+                "GitHub's Search API rate limit (30 req/min) was hit and no cached results "
+                "are available yet. Wait ~60 seconds and try again — subsequent calls will "
+                "be served from cache for 1 hour without touching the Search API."
+            ),
+            "username":   user["login"],
+            "difficulty": difficulty,
+        }
 
     def _score(issue: dict) -> float:
         lang          = issue.get("language", "")
@@ -466,14 +612,15 @@ async def recommend_issues(
         ) else 0
         return skill_val + recency_score * 0.3 + low_comp + interest_bonus
 
-    all_issues.sort(key=_score, reverse=True)
+    issues.sort(key=_score, reverse=True)
 
     return {
         "username":      user["login"],
         "difficulty":    difficulty,
         "skill_summary": {k: v for k, v in list(skills.items())[:6]},
-        "count":         len(all_issues[:count]),
-        "issues":        all_issues[:count],
+        "count":         len(issues[:count]),
+        "issues":        issues[:count],
+        "cached":        from_cache,
         "next_step":     "Call get_issue_details(url) on any issue, then explain_code_file() before editing.",
     }
 
@@ -729,6 +876,7 @@ async def find_issues(
 ) -> dict:
     """
     Search GitHub for open issues by language and difficulty.
+    Results are cached for 1 hour to avoid GitHub Search API rate limits (30 req/min).
     Use recommend_issues() for issues auto-matched to your skill profile.
 
     Args:
@@ -748,41 +896,38 @@ async def find_issues(
     if not lang_list:
         return {"error": "Provide at least one language."}
 
-    label      = "good first issue" if difficulty == "beginner" else "help wanted"
-    all_issues = []
+    label = "good first issue" if difficulty == "beginner" else "help wanted"
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        for lang in lang_list[:5]:
-            q = f'label:"{label}" language:{lang} stars:>{min_stars} is:open is:issue no:assignee'
-            r = await client.get(
-                "https://api.github.com/search/issues",
-                headers=_gh_headers(),
-                params={"q": q, "sort": "updated", "order": "desc",
-                        "per_page": min(count * 2, 30)},
-            )
-            if r.status_code == 403:
-                return {"error": "GitHub rate limit hit. Wait ~1 minute and try again."}
-            if r.status_code != 200:
-                continue
-            for item in r.json().get("items", []):
-                labels = [lb["name"] for lb in item.get("labels", [])]
-                all_issues.append({
-                    "title":        item["title"],
-                    "url":          item["html_url"],
-                    "repo":         item["repository_url"].replace("https://api.github.com/repos/", ""),
-                    "language":     lang,
-                    "difficulty":   _estimate_difficulty(labels),
-                    "labels":       labels,
-                    "comments":     item.get("comments", 0),
-                    "updated_at":   item.get("updated_at", "")[:10],
-                    "body_preview": (item.get("body") or "")[:300].strip(),
-                })
+    # Stable cache key: difficulty + sorted languages + min_stars
+    langs_key = "_".join(sorted(lang_list[:5]))
+    cache_key = f"codenova:issues:{difficulty}:{langs_key}:s{min_stars}"
+
+    queries = [
+        f'label:"{label}" language:{lang} stars:>{min_stars} is:open is:issue no:assignee'
+        for lang in lang_list[:5]
+    ]
+
+    all_issues, from_cache = await _search_issues_cached(
+        cache_key, queries, lang_list[:5], ttl=_TTL_ISSUES
+    )
+
+    if not all_issues and not from_cache:
+        return {
+            "error": "github_search_rate_limited",
+            "message": (
+                "GitHub's Search API rate limit (30 req/min) was hit and no cached results "
+                "are available. Wait ~60 seconds and try again."
+            ),
+            "difficulty": difficulty,
+            "languages_searched": lang_list,
+        }
 
     all_issues.sort(key=lambda x: (x["comments"], x["updated_at"]))
     return {
         "count":              len(all_issues[:count]),
         "difficulty":         difficulty,
         "languages_searched": lang_list,
+        "cached":             from_cache,
         "issues":             all_issues[:count],
     }
 
@@ -820,8 +965,8 @@ async def search_repos(
             {"q": q, "sort": "stars", "order": "desc", "per_page": min(count, 20)},
         )
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 403:
-            return {"error": "GitHub rate limit hit."}
+        if e.response.status_code in (403, 429):
+            return {"error": "GitHub rate limit hit. Wait ~1 minute and try again."}
         return {"error": f"GitHub API error {e.response.status_code}"}
 
     return {
@@ -888,7 +1033,7 @@ async def check_rate_limit() -> dict:
 @mcp.tool()
 async def clear_profile_cache() -> dict:
     """
-    Clears your cached GitHub profile from MongoDB (and Redis if connected).
+    Clears your cached GitHub profile from MongoDB (and Redis/memory if connected).
     Use this if get_my_profile() is returning stale or empty skill data.
     After clearing, the next get_my_profile() call will re-fetch live from GitHub.
     """
@@ -900,8 +1045,8 @@ async def clear_profile_cache() -> dict:
         return _BAD_TOKEN
 
     github_id = user["id"]
-    login = user["login"]
-    cleared = []
+    login     = user["login"]
+    cleared   = []
 
     # Clear MongoDB profile
     if _db is not None:
@@ -913,27 +1058,20 @@ async def clear_profile_cache() -> dict:
         except Exception as e:
             sys.stderr.write(f"[codenova] MongoDB clear error: {e}\n")
 
-    # Clear Redis whoami cache
-    if _cache is not None:
-        try:
-            short_key = f"codenova:whoami:{GITHUB_TOKEN[:16]}"
-            _cache.delete(short_key)
-            cleared.append("Redis whoami cache")
-            sys.stderr.write(f"[codenova] Cleared Redis cache for {login}\n")
-        except Exception as e:
-            sys.stderr.write(f"[codenova] Redis clear error: {e}\n")
-
-    if not cleared:
-        return {
-            "status": "nothing_to_clear",
-            "message": "No cache backends are connected (MongoDB and Redis both unavailable).",
-        }
+    # Clear whoami key + all recommendations for this user
+    whoami_key = f"codenova:whoami:{GITHUB_TOKEN[:16]}"
+    _cache_delete(whoami_key)
+    _cache_delete_prefix(f"codenova:recs:{user['id']}:")
+    cleared.append("search/recommendation cache (Redis + memory)")
 
     return {
-        "status": "cleared",
+        "status":  "cleared",
         "username": login,
         "cleared": cleared,
-        "message": f"Cache cleared for '{login}'. Call get_my_profile() to rebuild with fresh data.",
+        "message": (
+            f"Cache cleared for '{login}'. "
+            "Call get_my_profile() to rebuild with fresh data."
+        ),
     }
 
 
