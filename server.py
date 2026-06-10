@@ -169,7 +169,16 @@ def _db_get_profile(github_id: int) -> dict | None:
     if _db is None:
         return None
     try:
-        return _db.users.find_one({"github_id": github_id})
+        doc = _db.users.find_one({"github_id": github_id})
+        # Treat as cache MISS if skills are empty — prevents stale empty profiles
+        # from being served forever after a failed/incomplete initial fetch.
+        if doc and not doc.get("skills"):
+            sys.stderr.write(
+                f"[codenova] Cache miss (empty skills) for github_id={github_id}. "
+                "Will re-fetch from GitHub.\n"
+            )
+            return None
+        return doc
     except Exception:
         return None
 
@@ -343,7 +352,16 @@ async def get_my_profile() -> dict:
         sys.stderr.write(f"[codenova] repo fetch warn: {e}\n")
 
     skills, interests = _extract_skills(repos)
-    _db_save_profile(github_id, login, user, skills, interests)
+    # Only cache if we actually got skill data — prevents poisoning the cache
+    # with an empty dict when the repo fetch returned nothing useful.
+    if skills:
+        _db_save_profile(github_id, login, user, skills, interests)
+    else:
+        sys.stderr.write(
+            f"[codenova] Skipping DB cache write for '{login}': "
+            f"no skills extracted from {len(repos)} repos. "
+            "Will retry on next get_my_profile() call.\n"
+        )
 
     top_repos = sorted(repos, key=lambda r: r.get("stargazers_count", 0), reverse=True)[:5]
 
@@ -865,6 +883,58 @@ async def check_rate_limit() -> dict:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@mcp.tool()
+async def clear_profile_cache() -> dict:
+    """
+    Clears your cached GitHub profile from MongoDB (and Redis if connected).
+    Use this if get_my_profile() is returning stale or empty skill data.
+    After clearing, the next get_my_profile() call will re-fetch live from GitHub.
+    """
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
+
+    user = await _resolve_user()
+    if not user:
+        return _BAD_TOKEN
+
+    github_id = user["id"]
+    login = user["login"]
+    cleared = []
+
+    # Clear MongoDB profile
+    if _db is not None:
+        try:
+            result = _db.users.delete_one({"github_id": github_id})
+            if result.deleted_count:
+                cleared.append("MongoDB profile")
+                sys.stderr.write(f"[codenova] Cleared MongoDB profile for {login}\n")
+        except Exception as e:
+            sys.stderr.write(f"[codenova] MongoDB clear error: {e}\n")
+
+    # Clear Redis whoami cache
+    if _cache is not None:
+        try:
+            short_key = f"codenova:whoami:{GITHUB_TOKEN[:16]}"
+            _cache.delete(short_key)
+            cleared.append("Redis whoami cache")
+            sys.stderr.write(f"[codenova] Cleared Redis cache for {login}\n")
+        except Exception as e:
+            sys.stderr.write(f"[codenova] Redis clear error: {e}\n")
+
+    if not cleared:
+        return {
+            "status": "nothing_to_clear",
+            "message": "No cache backends are connected (MongoDB and Redis both unavailable).",
+        }
+
+    return {
+        "status": "cleared",
+        "username": login,
+        "cleared": cleared,
+        "message": f"Cache cleared for '{login}'. Call get_my_profile() to rebuild with fresh data.",
+    }
 
 
 # =====================================================
