@@ -1,27 +1,13 @@
 # ================================================
-# CodeNova MCP Server  —  Multi-user edition
-# stdio transport for Claude Desktop
+# CodeNova MCP Server  —  Local single-user edition
 #
-# SECURITY MODEL:
-#   1. github_token (per call) → identifies the user via GitHub API
-#      Server calls GET /user with the token to get github_id + login.
-#      This IS the identity — no separate username input needed.
+# Reads GITHUB_TOKEN from .env once at startup.
+# No SERVER_SECRET needed — this runs on your own machine.
+# All tools work without passing any credentials in each call.
 #
-#   2. SERVER_SECRET in .env → server-level gate.
-#      Prevents random people on the internet from using your
-#      Render deployment. You share this one key with your users.
-#      Each tool call must include it as `server_secret`.
-#
-#   3. All MongoDB reads/writes use {"github_id": <int>} as the key.
-#      Derived from the GitHub token on every call — never from
-#      user-supplied input. User A can never touch User B's data.
-#
-#   4. GitHub tokens are NEVER stored — only github_id + username
-#      + skills are persisted. Tokens stay in the user's Claude config.
-#
-# .env needs: SERVER_SECRET, GROQ_API_KEY (opt), MONGODB_URI (opt),
-#             REDIS_URL (opt)
-# No GITHUB_USERNAME, no GITHUB_TOKEN in server env.
+# Entry points:
+#   stdio  (Claude Desktop):  python mcp_stdio.py
+#   HTTP   (MCP Inspector):   uvicorn main:app --port 8000
 # ================================================
 
 import sys
@@ -39,27 +25,22 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 import httpx
 import re
-import secrets as _secrets
 from datetime import datetime
 from fastmcp import FastMCP
-from contextvars import ContextVar
 
-_request_github_token: ContextVar[str] = ContextVar("_request_github_token", default="")
-
-def _get_token_from_context() -> str:
-    return _request_github_token.get("")
 # =====================================================
-# SERVER CONFIG  (nothing user-specific here)
+# LOCAL CONFIG  — read once from .env
 # =====================================================
 
-SERVER_SECRET = os.getenv("SERVER_SECRET", "").strip()
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "").strip()
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
-if not SERVER_SECRET:
+if not GITHUB_TOKEN:
     sys.stderr.write(
-        "[codenova] WARNING: SERVER_SECRET not set. "
-        "All tool calls will be open — set it in .env.\n"
-        "Generate: python -c \"import secrets; print(secrets.token_hex(24))\"\n"
+        "[codenova] ERROR: GITHUB_TOKEN not set in .env.\n"
+        "Create a token at https://github.com/settings/tokens\n"
+        "Required scopes: read:user, public_repo\n"
+        "Then add: GITHUB_TOKEN=ghp_... to your .env file.\n"
     )
 
 # =====================================================
@@ -75,7 +56,7 @@ try:
     _db = Database.get_db()
     sys.stderr.write("[codenova] MongoDB connected\n")
 except Exception as _e:
-    sys.stderr.write(f"[codenova] MongoDB unavailable (no caching): {_e}\n")
+    sys.stderr.write(f"[codenova] MongoDB unavailable (profile caching off): {_e}\n")
 
 try:
     from cache.redis_manager import CacheManager
@@ -83,7 +64,7 @@ try:
     _cache = CacheManager
     sys.stderr.write("[codenova] Redis connected\n")
 except Exception as _e:
-    sys.stderr.write(f"[codenova] Redis unavailable (no caching): {_e}\n")
+    sys.stderr.write(f"[codenova] Redis unavailable (request caching off): {_e}\n")
 
 # =====================================================
 # FastMCP instance
@@ -92,10 +73,7 @@ except Exception as _e:
 mcp = FastMCP(
     "codenova",
     instructions=(
-        "CodeNova helps any developer find and contribute to open source. "
-        "Every tool needs two things: your `github_token` (a GitHub Personal "
-        "Access Token with read:user + public_repo scopes) and the `server_secret` "
-        "shared by the server operator. "
+        "CodeNova helps you find and contribute to open source projects on GitHub. "
         "Start with get_my_profile() to load your skills, then recommend_issues() "
         "to find matching issues, then get_issue_details() and explain_code_file() "
         "before writing any code."
@@ -103,60 +81,23 @@ mcp = FastMCP(
 )
 
 # =====================================================
-# AUTH + IDENTITY
+# SHARED HELPERS
 # =====================================================
 
-_DENY_SECRET = {
-    "error": "ACCESS_DENIED",
-    "message": (
-        "Invalid server_secret. "
-        "Ask the server operator for the correct SERVER_SECRET value."
-    ),
-}
-
-_DENY_TOKEN = {
-    "error": "INVALID_TOKEN",
-    "message": (
-        "Could not authenticate with GitHub using the provided github_token. "
-        "Create a token at https://github.com/settings/tokens "
-        "with scopes: read:user, public_repo"
-    ),
-}
-
-
-def _check_server_secret(server_secret: str) -> bool:
-    """Gate: is this caller allowed to use this server at all?
-
-    Rules:
-      - SERVER_SECRET not set in env  → open to everyone (dev mode)
-      - SERVER_SECRET set + caller passed a non-empty secret → must match
-      - SERVER_SECRET set + caller passed empty/no secret   → allowed
-        (remote SSE users connect via URL; their GitHub token is the real auth)
-    """
-    if not SERVER_SECRET:
-        return True  # not configured → open
-    if not server_secret or not server_secret.strip():
-        return True  # remote users don't need to pass it; GitHub token is auth
-    return _secrets.compare_digest(server_secret.strip(), SERVER_SECRET)
-
-
-def _gh_headers(github_token: str) -> dict:
+def _gh_headers() -> dict:
     return {
-        "Authorization": f"Bearer {github_token}",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
 
-async def _resolve_user(github_token: str) -> dict | None:
+async def _resolve_user() -> dict | None:
     """
-    Call GitHub /user with the token.
-    Returns the GitHub user object, or None on auth failure.
-    Token is NEVER stored — used only for this request.
+    Resolve the current user from GITHUB_TOKEN.
+    Cached in Redis for 5 minutes to avoid hammering the GitHub API.
     """
-    # Redis cache: use first 16 chars of token as a non-reversible cache key (5 min TTL)
-    # Avoids hitting GitHub /user on every single tool call.
-    short_key = f"codenova:whoami:{github_token[:16]}"
+    short_key = f"codenova:whoami:{GITHUB_TOKEN[:16]}"
 
     if _cache:
         cached = _cache.get(short_key)
@@ -167,34 +108,61 @@ async def _resolve_user(github_token: str) -> dict | None:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 "https://api.github.com/user",
-                headers=_gh_headers(github_token),
+                headers=_gh_headers(),
             )
             if r.status_code == 401:
                 return None
             r.raise_for_status()
             user = r.json()
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"[codenova] GitHub /user error: {e}\n")
         return None
 
     result = {
-        "id":         user["id"],           # int — used as DB key
-        "login":      user["login"],
-        "name":       user.get("name", ""),
-        "avatar_url": user.get("avatar_url", ""),
-        "bio":        user.get("bio", ""),
-        "location":   user.get("location", ""),
+        "id":           user["id"],
+        "login":        user["login"],
+        "name":         user.get("name", ""),
+        "avatar_url":   user.get("avatar_url", ""),
+        "bio":          user.get("bio", ""),
+        "location":     user.get("location", ""),
         "public_repos": user.get("public_repos", 0),
         "followers":    user.get("followers", 0),
     }
 
     if _cache:
-        _cache.set(short_key, result, 300)  # 5 min TTL
+        _cache.set(short_key, result, 300)
 
     return result
 
 
+async def _gh_get(url: str, params: dict = None):
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=_gh_headers(), params=params or {})
+        r.raise_for_status()
+        return r.json()
+
+
+def _call_groq(prompt: str, max_tokens: int = 1000) -> str:
+    if not GROQ_API_KEY:
+        return ""
+    import requests
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
 # =====================================================
-# DB HELPERS  (always scoped to github_id)
+# DB HELPERS
 # =====================================================
 
 def _db_get_profile(github_id: int) -> dict | None:
@@ -228,51 +196,25 @@ def _db_save_profile(github_id: int, login: str, extra: dict, skills: dict, inte
 
 
 # =====================================================
-# SHARED HELPERS
+# SKILL EXTRACTION + DIFFICULTY HELPERS
 # =====================================================
 
-async def _gh_get(url: str, token: str, params: dict = None):
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers=_gh_headers(token), params=params or {})
-        r.raise_for_status()
-        return r.json()
-
-
-def _call_groq(prompt: str, max_tokens: int = 1000) -> str:
-    if not GROQ_API_KEY:
-        return ""
-    import requests
-    resp = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": "llama-3.3-70b-versatile",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
-
-
-DIFFICULTY_BEGINNER     = {"good first issue","good-first-issue","beginner","easy",
-                           "starter","first-timers-only","help wanted","beginner-friendly"}
-DIFFICULTY_ADVANCED     = {"advanced","hard","complex","performance","security","architecture"}
-DIFFICULTY_INTERMEDIATE = {"intermediate","medium","enhancement","feature","improvement"}
+DIFFICULTY_BEGINNER     = {"good first issue", "good-first-issue", "beginner", "easy",
+                            "starter", "first-timers-only", "help wanted", "beginner-friendly"}
+DIFFICULTY_ADVANCED     = {"advanced", "hard", "complex", "performance", "security", "architecture"}
+DIFFICULTY_INTERMEDIATE = {"intermediate", "medium", "enhancement", "feature", "improvement"}
 
 TOPIC_INTEREST = {
-    "react":"web","vue":"web","angular":"web","nextjs":"web","html":"web","css":"web",
-    "frontend":"frontend","django":"backend","flask":"backend","fastapi":"backend",
-    "express":"backend","backend":"backend","api":"backend",
-    "machine-learning":"ml","deep-learning":"ml","tensorflow":"ml","pytorch":"ml","nlp":"ml",
-    "data-science":"data","docker":"infra","kubernetes":"infra","devops":"infra",
-    "terraform":"infra","aws":"cloud","gcp":"cloud","azure":"cloud",
-    "esp32":"embedded","arduino":"embedded","iot":"embedded","embedded":"embedded",
-    "lora":"embedded","security":"security","cryptography":"security",
-    "android":"mobile","ios":"mobile","flutter":"mobile",
-    "mongodb":"database","postgresql":"database","redis":"database","sql":"database",
+    "react": "web", "vue": "web", "angular": "web", "nextjs": "web", "html": "web", "css": "web",
+    "frontend": "frontend", "django": "backend", "flask": "backend", "fastapi": "backend",
+    "express": "backend", "backend": "backend", "api": "backend",
+    "machine-learning": "ml", "deep-learning": "ml", "tensorflow": "ml", "pytorch": "ml", "nlp": "ml",
+    "data-science": "data", "docker": "infra", "kubernetes": "infra", "devops": "infra",
+    "terraform": "infra", "aws": "cloud", "gcp": "cloud", "azure": "cloud",
+    "esp32": "embedded", "arduino": "embedded", "iot": "embedded", "embedded": "embedded",
+    "lora": "embedded", "security": "security", "cryptography": "security",
+    "android": "mobile", "ios": "mobile", "flutter": "mobile",
+    "mongodb": "database", "postgresql": "database", "redis": "database", "sql": "database",
 }
 
 
@@ -303,11 +245,11 @@ def _extract_skills(repos: list) -> tuple:
         total += w
         lang = repo.get("language")
         if not lang:
-            txt = (repo.get("name","") + " " + (repo.get("description") or "")).lower()
+            txt = (repo.get("name", "") + " " + (repo.get("description") or "")).lower()
             for kw, canon in [
-                ("python","Python"),("javascript","JavaScript"),("typescript","TypeScript"),
-                ("rust","Rust"),("golang","Go"),("arduino","C"),("esp32","C"),
-                ("java ","Java"),("c++","C++"),("shell","Shell"),
+                ("python", "Python"), ("javascript", "JavaScript"), ("typescript", "TypeScript"),
+                ("rust", "Rust"), ("golang", "Go"), ("arduino", "C"), ("esp32", "C"),
+                ("java ", "Java"), ("c++", "C++"), ("shell", "Shell"),
             ]:
                 if kw in txt:
                     lang = canon
@@ -325,36 +267,46 @@ def _extract_skills(repos: list) -> tuple:
     return dict(sorted(skills.items(), key=lambda x: x[1], reverse=True)[:15]), list(interests)
 
 
+_NO_TOKEN = {
+    "error": "NO_GITHUB_TOKEN",
+    "message": (
+        "GITHUB_TOKEN is not set in your .env file. "
+        "Create a token at https://github.com/settings/tokens "
+        "with scopes: read:user, public_repo — then add it to .env."
+    ),
+}
+
+_BAD_TOKEN = {
+    "error": "INVALID_GITHUB_TOKEN",
+    "message": (
+        "Could not authenticate with GitHub. "
+        "Check that GITHUB_TOKEN in your .env is valid and has "
+        "scopes: read:user, public_repo."
+    ),
+}
+
+
 # =====================================================
 # MCP TOOLS
 # =====================================================
 
 @mcp.tool()
-async def get_my_profile(github_token: str = "", server_secret: str = "") -> dict:
+async def get_my_profile() -> dict:
     """
-    Fetch YOUR GitHub profile and infer your skill set from public repos.
-    Always call this first — it loads your identity for all other tools.
-
-    Args:
-        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-                       Create at https://github.com/settings/tokens
-                       Required scopes: read:user, public_repo
-        server_secret: The SERVER_SECRET provided by the server operator (auto-loaded from env if set).
+    Fetch your GitHub profile and infer your skill set from your public repos.
+    Call this first — it loads your identity for all other tools.
+    Your GITHUB_TOKEN is read automatically from .env.
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
     github_id = user["id"]
     login     = user["login"]
 
-    # Check DB cache
     cached = _db_get_profile(github_id)
     if cached:
         return {
@@ -368,7 +320,6 @@ async def get_my_profile(github_token: str = "", server_secret: str = "") -> dic
             "recommended_difficulty": _recommend_difficulty(cached.get("skills", {})),
         }
 
-    # Fetch public repos
     repos = []
     try:
         page = 1
@@ -376,8 +327,8 @@ async def get_my_profile(github_token: str = "", server_secret: str = "") -> dic
             while len(repos) < 200:
                 r = await client.get(
                     f"https://api.github.com/users/{login}/repos",
-                    headers=_gh_headers(github_token),
-                    params={"per_page":100,"page":page,"sort":"updated","type":"public"},
+                    headers=_gh_headers(),
+                    params={"per_page": 100, "page": page, "sort": "updated", "type": "public"},
                 )
                 if r.status_code != 200:
                     break
@@ -397,16 +348,16 @@ async def get_my_profile(github_token: str = "", server_secret: str = "") -> dic
     top_repos = sorted(repos, key=lambda r: r.get("stargazers_count", 0), reverse=True)[:5]
 
     return {
-        "source":      "github",
-        "username":    login,
-        "name":        user.get("name", ""),
-        "bio":         user.get("bio", ""),
-        "avatar_url":  user.get("avatar_url", ""),
-        "public_repos":user.get("public_repos", 0),
-        "followers":   user.get("followers", 0),
-        "location":    user.get("location", ""),
-        "skills":      skills,
-        "interests":   interests,
+        "source":       "github",
+        "username":     login,
+        "name":         user.get("name", ""),
+        "bio":          user.get("bio", ""),
+        "avatar_url":   user.get("avatar_url", ""),
+        "public_repos": user.get("public_repos", 0),
+        "followers":    user.get("followers", 0),
+        "location":     user.get("location", ""),
+        "skills":       skills,
+        "interests":    interests,
         "top_repos": [
             {
                 "name":        r["name"],
@@ -423,32 +374,25 @@ async def get_my_profile(github_token: str = "", server_secret: str = "") -> dic
 
 @mcp.tool()
 async def recommend_issues(
-    github_token: str = "",
-    server_secret: str = "",
     difficulty: str = "auto",
     count: int = 10,
 ) -> dict:
     """
-    Full pipeline: loads YOUR skills → finds matching open GitHub issues.
+    Full pipeline: loads your skills then finds matching open GitHub issues.
     This is the main 'help me contribute' tool.
 
     Args:
-        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
-        difficulty:    'beginner', 'intermediate', 'advanced', or 'auto'
-        count:         Number of issues to return (max 20)
+        difficulty: 'beginner', 'intermediate', 'advanced', or 'auto'
+        count:      Number of issues to return (max 20)
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
-    profile = await get_my_profile(github_token, server_secret)
+    profile = await get_my_profile()
     if "error" in profile:
         return profile
 
@@ -467,11 +411,11 @@ async def recommend_issues(
             q = f'label:"{label}" language:{lang} stars:>50 is:open is:issue no:assignee'
             r = await client.get(
                 "https://api.github.com/search/issues",
-                headers=_gh_headers(github_token),
+                headers=_gh_headers(),
                 params={"q": q, "sort": "updated", "order": "desc", "per_page": 15},
             )
             if r.status_code == 403:
-                return {"error": "GitHub rate limit hit. Wait ~1 minute."}
+                return {"error": "GitHub rate limit hit. Wait ~1 minute and try again."}
             if r.status_code != 200:
                 continue
             for item in r.json().get("items", []):
@@ -490,9 +434,9 @@ async def recommend_issues(
                 })
 
     def _score(issue: dict) -> float:
-        lang      = issue.get("language", "")
-        skill_val = skills.get(lang, 0) / 100
-        recency   = issue.get("updated_at", "")
+        lang          = issue.get("language", "")
+        skill_val     = skills.get(lang, 0) / 100
+        recency       = issue.get("updated_at", "")
         try:
             days_old = (datetime.utcnow() - datetime.strptime(recency, "%Y-%m-%d")).days
         except Exception:
@@ -517,28 +461,19 @@ async def recommend_issues(
 
 
 @mcp.tool()
-async def get_issue_details(
-    issue_url: str,
-    github_token: str = "",
-    server_secret: str = "",
-) -> dict:
+async def get_issue_details(issue_url: str) -> dict:
     """
     Fetch full details of a GitHub issue including comments and an AI task summary.
 
     Args:
-        issue_url:     Full GitHub issue URL, e.g. https://github.com/django/django/issues/1234
-        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
+        issue_url: Full GitHub issue URL, e.g. https://github.com/django/django/issues/1234
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
     m = re.match(r"https://github\.com/([^/]+/[^/]+)/issues/(\d+)", issue_url)
     if not m:
@@ -546,10 +481,7 @@ async def get_issue_details(
 
     repo, number = m.group(1), m.group(2)
     try:
-        issue = await _gh_get(
-            f"https://api.github.com/repos/{repo}/issues/{number}",
-            github_token,
-        )
+        issue = await _gh_get(f"https://api.github.com/repos/{repo}/issues/{number}")
     except httpx.HTTPStatusError as e:
         return {"error": f"GitHub API error {e.response.status_code}"}
 
@@ -557,7 +489,6 @@ async def get_issue_details(
     try:
         raw = await _gh_get(
             f"https://api.github.com/repos/{repo}/issues/{number}/comments",
-            github_token,
             {"per_page": 10},
         )
         for c in raw[:10]:
@@ -606,8 +537,6 @@ async def get_issue_details(
 async def explain_code_file(
     repo_full_name: str,
     file_path: str,
-    github_token: str = "",
-    server_secret: str = "",
     issue_context: str = "",
 ) -> dict:
     """
@@ -616,28 +545,21 @@ async def explain_code_file(
     Args:
         repo_full_name: 'owner/repo' (e.g. 'django/django')
         file_path:      Path inside repo (e.g. 'django/db/models/query.py')
-        github_token:   Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-        server_secret:  The SERVER_SECRET from the server operator (auto-loaded from env if set).
         issue_context:  Optional issue title for a more focused explanation.
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
     if "/" not in repo_full_name:
         return {"error": "Use 'owner/repo' format."}
 
     default_branch = "main"
     try:
-        repo_info = await _gh_get(
-            f"https://api.github.com/repos/{repo_full_name}", github_token
-        )
+        repo_info = await _gh_get(f"https://api.github.com/repos/{repo_full_name}")
         default_branch = repo_info.get("default_branch", "main")
     except Exception:
         pass
@@ -663,7 +585,6 @@ async def explain_code_file(
 
     if GROQ_API_KEY:
         try:
-            current = None
             raw = _call_groq(
                 f"You are helping a developer contribute to open source for the first time.\n"
                 f"{'Issue context: ' + issue_context if issue_context else ''}\n"
@@ -674,9 +595,10 @@ async def explain_code_file(
                 f"WHERE TO LOOK:\n- specific area for the issue/feature\n- what not to touch\n- how to test",
                 max_tokens=1000,
             )
+            current = None
             for line in raw.split("\n"):
                 up = line.strip().upper()
-                if "WHAT IT DOES"  in up: current = "w"
+                if "WHAT IT DOES"   in up: current = "w"
                 elif "KEY CONCEPTS" in up: current = "k"
                 elif "WHERE TO LOOK" in up: current = "t"
                 elif current == "w" and line.strip(): explanation       += line + "\n"
@@ -685,7 +607,7 @@ async def explain_code_file(
         except Exception as e:
             explanation = f"LLM error: {e}"
     else:
-        explanation = "GROQ_API_KEY not set on server — AI explanations disabled."
+        explanation = "GROQ_API_KEY not set in .env — AI explanations disabled."
 
     return {
         "file":              file_path,
@@ -700,36 +622,25 @@ async def explain_code_file(
 
 
 @mcp.tool()
-async def get_repo_details(
-    repo_full_name: str,
-    github_token: str = "",
-    server_secret: str = "",
-) -> dict:
+async def get_repo_details(repo_full_name: str) -> dict:
     """
     Get details about a GitHub repo: languages, CONTRIBUTING guide, README, clone command.
 
     Args:
         repo_full_name: 'owner/repo' (e.g. 'facebook/react')
-        github_token:   Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-        server_secret:  The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
     if "/" not in repo_full_name:
         return {"error": "Use 'owner/repo' format."}
 
     try:
-        repo = await _gh_get(
-            f"https://api.github.com/repos/{repo_full_name}", github_token
-        )
+        repo = await _gh_get(f"https://api.github.com/repos/{repo_full_name}")
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return {"error": f"Repo '{repo_full_name}' not found."}
@@ -737,9 +648,7 @@ async def get_repo_details(
 
     langs = {}
     try:
-        langs = await _gh_get(
-            f"https://api.github.com/repos/{repo_full_name}/languages", github_token
-        )
+        langs = await _gh_get(f"https://api.github.com/repos/{repo_full_name}/languages")
     except Exception:
         pass
 
@@ -750,13 +659,13 @@ async def get_repo_details(
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
             f"https://api.github.com/repos/{repo_full_name}/contents/CONTRIBUTING.md",
-            headers=_gh_headers(github_token),
+            headers=_gh_headers(),
         )
         if r.status_code == 200:
             has_contributing = True
             contributing_url = f"https://github.com/{repo_full_name}/blob/HEAD/CONTRIBUTING.md"
 
-        for branch in [repo.get("default_branch","main"), "main", "master"]:
+        for branch in [repo.get("default_branch", "main"), "main", "master"]:
             r2 = await client.get(
                 f"https://raw.githubusercontent.com/{repo_full_name}/{branch}/README.md"
             )
@@ -796,33 +705,26 @@ async def get_repo_details(
 @mcp.tool()
 async def find_issues(
     languages: str,
-    github_token: str = "",
-    server_secret: str = "",
     difficulty: str = "beginner",
     count: int = 10,
     min_stars: int = 50,
 ) -> dict:
     """
     Search GitHub for open issues by language and difficulty.
-    Use recommend_issues() for issues auto-matched to YOUR skill profile.
+    Use recommend_issues() for issues auto-matched to your skill profile.
 
     Args:
-        languages:     Comma-separated (e.g. 'Python,JavaScript')
-        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
-        difficulty:    'beginner', 'intermediate', or 'advanced'
-        count:         Results to return (max 30)
-        min_stars:     Minimum repo stars
+        languages:  Comma-separated (e.g. 'Python,JavaScript')
+        difficulty: 'beginner', 'intermediate', or 'advanced'
+        count:      Results to return (max 30)
+        min_stars:  Minimum repo stars
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
     lang_list = [l.strip() for l in languages.split(",") if l.strip()]
     if not lang_list:
@@ -836,12 +738,12 @@ async def find_issues(
             q = f'label:"{label}" language:{lang} stars:>{min_stars} is:open is:issue no:assignee'
             r = await client.get(
                 "https://api.github.com/search/issues",
-                headers=_gh_headers(github_token),
+                headers=_gh_headers(),
                 params={"q": q, "sort": "updated", "order": "desc",
                         "per_page": min(count * 2, 30)},
             )
             if r.status_code == 403:
-                return {"error": "GitHub rate limit hit. Wait ~1 minute."}
+                return {"error": "GitHub rate limit hit. Wait ~1 minute and try again."}
             if r.status_code != 200:
                 continue
             for item in r.json().get("items", []):
@@ -870,8 +772,6 @@ async def find_issues(
 @mcp.tool()
 async def search_repos(
     query: str,
-    github_token: str = "",
-    server_secret: str = "",
     language: str = "",
     min_stars: int = 100,
     count: int = 10,
@@ -880,22 +780,17 @@ async def search_repos(
     Search GitHub for repositories to contribute to.
 
     Args:
-        query:         Keywords (e.g. 'web framework', 'machine learning cli')
-        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
-        language:      Filter by language (e.g. 'Python'). Empty = any.
-        min_stars:     Minimum star count
-        count:         Results to return (max 20)
+        query:     Keywords (e.g. 'web framework', 'machine learning cli')
+        language:  Filter by language (e.g. 'Python'). Empty = any.
+        min_stars: Minimum star count
+        count:     Results to return (max 20)
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
     q = f"{query} stars:>{min_stars} is:public archived:false"
     if language:
@@ -904,7 +799,6 @@ async def search_repos(
     try:
         data = await _gh_get(
             "https://api.github.com/search/repositories",
-            github_token,
             {"q": q, "sort": "stars", "order": "desc", "per_page": min(count, 20)},
         )
     except httpx.HTTPStatusError as e:
@@ -924,7 +818,7 @@ async def search_repos(
                 "language":    r.get("language", ""),
                 "topics":      r.get("topics", [])[:5],
                 "open_issues": r.get("open_issues_count", 0),
-                "last_updated":r.get("updated_at", "")[:10],
+                "last_updated": r.get("updated_at", "")[:10],
                 "good_first_issues_url": (
                     f"https://github.com/{r['full_name']}/issues"
                     f"?q=is:open+label:\"good+first+issue\""
@@ -936,30 +830,20 @@ async def search_repos(
 
 
 @mcp.tool()
-async def check_rate_limit(
-    github_token: str = "",
-    server_secret: str = "",
-) -> dict:
+async def check_rate_limit() -> dict:
     """
-    Check current GitHub API rate limit for YOUR token.
+    Check your current GitHub API rate limit.
     Call this if tools are returning rate limit errors.
-
-    Args:
-        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
-        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
-    github_token  = github_token  or github_token = github_token or os.getenv("GITHUB_TOKEN", "") or _get_token_from_context()
-    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+    if not GITHUB_TOKEN:
+        return _NO_TOKEN
 
-    if not _check_server_secret(server_secret):
-        return _DENY_SECRET
-
-    user = await _resolve_user(github_token)
+    user = await _resolve_user()
     if not user:
-        return _DENY_TOKEN
+        return _BAD_TOKEN
 
     try:
-        data = await _gh_get("https://api.github.com/rate_limit", github_token)
+        data = await _gh_get("https://api.github.com/rate_limit")
 
         def _fmt(r: dict) -> dict:
             rem   = r.get("remaining", 0)
@@ -975,9 +859,9 @@ async def check_rate_limit(
             }
 
         return {
-            "for_user":  user["login"],
-            "core":      _fmt(data.get("resources", {}).get("core", {})),
-            "search":    _fmt(data.get("resources", {}).get("search", {})),
+            "for_user": user["login"],
+            "core":     _fmt(data.get("resources", {}).get("core", {})),
+            "search":   _fmt(data.get("resources", {}).get("search", {})),
         }
     except Exception as e:
         return {"error": str(e)}

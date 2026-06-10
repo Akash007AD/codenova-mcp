@@ -1,10 +1,8 @@
 # CodeNova MCP Server — Python 3.11+
 # pip install -r requirements.txt
 
-# ── MCP + HTTP server (needed for Render SSE deployment) ────────────
+# ── MCP framework ────────────────────────────────────────────────────
 fastmcp>=2.14.7
-fastapi>=0.115.12
-uvicorn[standard]>=0.34.2
 
 # ── HTTP client ──────────────────────────────────────────────────────
 httpx>=0.28.1
@@ -13,11 +11,20 @@ requests>=2.32.3
 # ── Config ───────────────────────────────────────────────────────────
 python-dotenv>=1.1.0
 
-# ── LLM (optional — AI explanations) ────────────────────────────────
+# ── LLM (optional — AI explanations via Groq) ────────────────────────
+# Remove if you don't need explain_code_file() AI summaries.
 groq>=0.15.0
 
-# ── MongoDB (optional — profile caching) ────────────────────────────
+# ── MongoDB (optional — profile caching across restarts) ─────────────
 pymongo>=4.11.3
 
-# ── Redis (optional — caching) ───────────────────────────────────────
+# ── Redis (optional — request-level caching) ─────────────────────────
 redis>=5.2.1
+
+# ── Background jobs (optional — only needed with MongoDB) ────────────
+apscheduler>=3.10.4
+
+# ── HTTP server (only needed for: uvicorn main:app) ──────────────────
+# Not required for Claude Desktop stdio mode.
+fastapi>=0.115.12
+uvicorn[standard]>=0.34.2
