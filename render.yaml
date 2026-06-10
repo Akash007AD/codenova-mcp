@@ -2,34 +2,24 @@ services:
   - type: web
     name: codenova-mcp
     runtime: python
-    region: singapore       # closest to India
+    region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.0"
       - key: ENVIRONMENT
         value: production
-      - key: DEBUG
-        value: "False"
-      # ── Set these manually in Render dashboard ──────────────────────────
-      # MONGODB_URI
-      # REDIS_URL
-      # GROQ_API_KEY
-      # GITHUB_CLIENT_ID
-      # GITHUB_CLIENT_SECRET
-      # GITHUB_CALLBACK_URL   = https://codenova-mcp.onrender.com/auth/github/callback
-      # GITHUB_TOKEN
-      # JWT_SECRET
-      # ENCRYPTION_KEY
+
+      # ── Set these in Render Dashboard → Environment ──────────────
+      # (never commit real values to git)
       #
-      # FRONTEND_URL          ← THIS IS THE KEY ONE.
-      #                         Set to your deployed frontend URL, e.g.:
-      #                           https://codenova-frontend.onrender.com
-      #                         or for local dev testing:
-      #                           http://localhost:3000
-      #
-      #                         After OAuth, the backend redirects to:
-      #                           {FRONTEND_URL}/auth/callback?token=...
+      # GITHUB_USERNAME   your GitHub login, e.g. Akash007AD
+      # GITHUB_TOKEN      ghp_...  (read:user + public_repo scopes)
+      # MCP_SECRET        generate: python -c "import secrets; print(secrets.token_hex(24))"
+      # GROQ_API_KEY      gsk_...  (optional, enables AI explanations)
+      # MONGODB_URI       mongodb+srv://...  (optional, profile caching)
+      # REDIS_URL         redis://...        (optional, caching)
+      # REDIS_PASSWORD    (if Redis needs auth)

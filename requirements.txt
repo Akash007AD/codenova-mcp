@@ -1,37 +1,23 @@
-# ================================================
-# CodeNova MCP Server — Python Dependencies
-# Python 3.11+  |  pip install -r requirements.txt
-# ================================================
+# CodeNova MCP Server — Python 3.11+
+# pip install -r requirements.txt
 
-# ── MCP / Server framework ──────────────────────
+# ── MCP + HTTP server (needed for Render SSE deployment) ────────────
 fastmcp>=2.14.7
 fastapi>=0.115.12
 uvicorn[standard]>=0.34.2
 
-# ── Database ────────────────────────────────────
-pymongo>=4.11.3
-motor>=3.7.0
-
-# ── Caching ─────────────────────────────────────
-redis>=5.2.1
-
-# ── GitHub Integration ──────────────────────────
-PyGithub>=2.6.1
+# ── HTTP client ──────────────────────────────────────────────────────
 httpx>=0.28.1
-
-# ── LLM Providers ───────────────────────────────
-groq>=0.15.0
-# anthropic>=0.50.0        # uncomment if switching to Option B in main.py
-
-# ── Background Jobs ─────────────────────────────
-apscheduler>=3.11.0
-
-# ── Auth & Security ─────────────────────────────
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-cryptography>=44.0.2
-
-# ── Config & Utilities ──────────────────────────
-python-dotenv>=1.1.0
-pydantic>=2.11.7
 requests>=2.32.3
+
+# ── Config ───────────────────────────────────────────────────────────
+python-dotenv>=1.1.0
+
+# ── LLM (optional — AI explanations) ────────────────────────────────
+groq>=0.15.0
+
+# ── MongoDB (optional — profile caching) ────────────────────────────
+pymongo>=4.11.3
+
+# ── Redis (optional — caching) ───────────────────────────────────────
+redis>=5.2.1
