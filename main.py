@@ -233,13 +233,15 @@ async def github_callback(code: str, state: str):
     encrypted_token = encrypt_token(github_token)
     user = user_model.create_or_update(github_user, encrypted_token)
 
-    # Only overwrite skills if GitHub actually returned something.
-    # If repos have no language data, keep whatever the user already saved
-    # rather than wiping their profile back to empty on every login.
+    # Merge skills: only replace stored skills if the freshly-extracted set is
+    # strictly richer (more languages detected) than what's already saved.
+    # This prevents a re-login from wiping a manually-curated or previously
+    # populated profile when GitHub returns no language data (e.g. all repos
+    # are Jupyter notebooks, configs, or have language=null).
     existing_skills    = user.get("skills", {})
     existing_interests = user.get("interests", [])
-    final_skills    = skills    if skills    else existing_skills
-    final_interests = interests if interests else existing_interests
+    final_skills    = skills    if len(skills) >= len(existing_skills)       else existing_skills
+    final_interests = interests if len(interests) >= len(existing_interests) else existing_interests
     user_model.update_skills(str(user["_id"]), final_skills, final_interests)
 
     # Create session JWT
@@ -248,6 +250,10 @@ async def github_callback(code: str, state: str):
         github_id=github_user["id"],
         username=github_user["login"]
     )
+
+    # Bust any stale Redis profile (e.g. a previous login that cached empty
+    # skills) so the re-cache below is guaranteed to serve fresh data.
+    CacheManager.invalidate_profile(github_user["login"])
 
     # Cache profile in Redis
     CacheManager.cache_profile(github_user["login"], {
@@ -826,15 +832,41 @@ def mcp_get_user_progress(user_id: str) -> dict:
 @mcp.tool()
 def mcp_analyze_profile(github_username: str) -> dict:
     """MCP Tool: Get stored profile for a GitHub username"""
+    # 1. Try Redis cache first (fast path)
+    cached = CacheManager.get_profile(github_username)
+    if cached:
+        skills      = cached.get("skills", {})
+        interests   = cached.get("interests", [])
+        return {
+            "username":        cached.get("username", github_username),
+            "avatar_url":      cached.get("avatar_url", ""),
+            "skills":          skills,
+            "interests":       interests,
+            "contributions":   cached.get("contributions", 0),
+            "streak":          cached.get("streak", 0),
+            "total_xp":        cached.get("total_xp", 0),
+            "profile_complete": bool(skills),
+            "source":          "cache"
+        }
+
+    # 2. Fall back to MongoDB
     user_model = UserModel()
     user = user_model.get_by_username(github_username)
     if not user:
-        return {"error": f"User '{github_username}' not found in CodeNova"}
+        return {"error": f"User '{github_username}' not found in CodeNova — have you logged in via GitHub OAuth?"}
+
+    skills    = user.get("skills", {})
+    interests = user.get("interests", [])
     return {
-        "username":      user["username"],
-        "skills":        user.get("skills", {}),
-        "interests":     user.get("interests", []),
-        "contributions": user.get("contributions", 0)
+        "username":        user["username"],
+        "avatar_url":      user.get("avatar_url", ""),
+        "skills":          skills,
+        "interests":       interests,
+        "contributions":   user.get("contributions", 0),
+        "streak":          user.get("streak", 0),
+        "total_xp":        user.get("total_xp", 0),
+        "profile_complete": bool(skills),
+        "source":          "database"
     }
 
 
