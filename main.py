@@ -233,8 +233,14 @@ async def github_callback(code: str, state: str):
     encrypted_token = encrypt_token(github_token)
     user = user_model.create_or_update(github_user, encrypted_token)
 
-    # Update skills
-    user_model.update_skills(str(user["_id"]), skills, interests)
+    # Only overwrite skills if GitHub actually returned something.
+    # If repos have no language data, keep whatever the user already saved
+    # rather than wiping their profile back to empty on every login.
+    existing_skills    = user.get("skills", {})
+    existing_interests = user.get("interests", [])
+    final_skills    = skills    if skills    else existing_skills
+    final_interests = interests if interests else existing_interests
+    user_model.update_skills(str(user["_id"]), final_skills, final_interests)
 
     # Create session JWT
     jwt_token = create_jwt(
@@ -248,8 +254,9 @@ async def github_callback(code: str, state: str):
         "user_id": str(user["_id"]),
         "username": github_user["login"],
         "avatar_url": github_user.get("avatar_url"),
-        "skills": skills,
-        "interests": interests,
+        "skills": final_skills,
+        "interests": final_interests,
+        "skills_updated_at": str(datetime.utcnow()),
         "contributions": user.get("contributions", 0),
         "streak": user.get("streak", 0)
     })
@@ -301,6 +308,7 @@ async def get_profile(current_user: dict = Depends(get_current_user)):
         "streak": user.get("streak", 0),
         "total_xp": user.get("total_xp", 0),
         "completed_issues": user.get("completed_issues", []),
+        "skills_updated_at": str(user.get("skills_updated_at", "")),
         "last_contribution_date": str(user.get("last_contribution_date", ""))
     }
 
