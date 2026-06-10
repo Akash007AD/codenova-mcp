@@ -120,9 +120,18 @@ _DENY_TOKEN = {
 
 
 def _check_server_secret(server_secret: str) -> bool:
-    """Gate: is this caller allowed to use this server at all?"""
+    """Gate: is this caller allowed to use this server at all?
+
+    Rules:
+      - SERVER_SECRET not set in env  → open to everyone (dev mode)
+      - SERVER_SECRET set + caller passed a non-empty secret → must match
+      - SERVER_SECRET set + caller passed empty/no secret   → allowed
+        (remote SSE users connect via URL; their GitHub token is the real auth)
+    """
     if not SERVER_SECRET:
         return True  # not configured → open
+    if not server_secret or not server_secret.strip():
+        return True  # remote users don't need to pass it; GitHub token is auth
     return _secrets.compare_digest(server_secret.strip(), SERVER_SECRET)
 
 
@@ -316,17 +325,20 @@ def _extract_skills(repos: list) -> tuple:
 # =====================================================
 
 @mcp.tool()
-async def get_my_profile(github_token: str, server_secret: str = "") -> dict:
+async def get_my_profile(github_token: str = "", server_secret: str = "") -> dict:
     """
     Fetch YOUR GitHub profile and infer your skill set from public repos.
     Always call this first — it loads your identity for all other tools.
 
     Args:
-        github_token:  Your GitHub Personal Access Token.
+        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
                        Create at https://github.com/settings/tokens
                        Required scopes: read:user, public_repo
-        server_secret: The SERVER_SECRET provided by the server operator.
+        server_secret: The SERVER_SECRET provided by the server operator (auto-loaded from env if set).
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
@@ -406,7 +418,7 @@ async def get_my_profile(github_token: str, server_secret: str = "") -> dict:
 
 @mcp.tool()
 async def recommend_issues(
-    github_token: str,
+    github_token: str = "",
     server_secret: str = "",
     difficulty: str = "auto",
     count: int = 10,
@@ -416,11 +428,14 @@ async def recommend_issues(
     This is the main 'help me contribute' tool.
 
     Args:
-        github_token:  Your GitHub Personal Access Token.
-        server_secret: The SERVER_SECRET from the server operator.
+        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
+        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
         difficulty:    'beginner', 'intermediate', 'advanced', or 'auto'
         count:         Number of issues to return (max 20)
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
@@ -498,18 +513,21 @@ async def recommend_issues(
 
 @mcp.tool()
 async def get_issue_details(
-    github_token: str,
     issue_url: str,
+    github_token: str = "",
     server_secret: str = "",
 ) -> dict:
     """
     Fetch full details of a GitHub issue including comments and an AI task summary.
 
     Args:
-        github_token:  Your GitHub Personal Access Token.
         issue_url:     Full GitHub issue URL, e.g. https://github.com/django/django/issues/1234
-        server_secret: The SERVER_SECRET from the server operator.
+        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
+        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
@@ -581,9 +599,9 @@ async def get_issue_details(
 
 @mcp.tool()
 async def explain_code_file(
-    github_token: str,
     repo_full_name: str,
     file_path: str,
+    github_token: str = "",
     server_secret: str = "",
     issue_context: str = "",
 ) -> dict:
@@ -591,12 +609,15 @@ async def explain_code_file(
     Fetch a source file from GitHub and explain it for a first-time contributor.
 
     Args:
-        github_token:   Your GitHub Personal Access Token.
         repo_full_name: 'owner/repo' (e.g. 'django/django')
         file_path:      Path inside repo (e.g. 'django/db/models/query.py')
-        server_secret:  The SERVER_SECRET from the server operator.
+        github_token:   Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
+        server_secret:  The SERVER_SECRET from the server operator (auto-loaded from env if set).
         issue_context:  Optional issue title for a more focused explanation.
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
@@ -675,18 +696,21 @@ async def explain_code_file(
 
 @mcp.tool()
 async def get_repo_details(
-    github_token: str,
     repo_full_name: str,
+    github_token: str = "",
     server_secret: str = "",
 ) -> dict:
     """
     Get details about a GitHub repo: languages, CONTRIBUTING guide, README, clone command.
 
     Args:
-        github_token:   Your GitHub Personal Access Token.
         repo_full_name: 'owner/repo' (e.g. 'facebook/react')
-        server_secret:  The SERVER_SECRET from the server operator.
+        github_token:   Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
+        server_secret:  The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
@@ -766,8 +790,8 @@ async def get_repo_details(
 
 @mcp.tool()
 async def find_issues(
-    github_token: str,
     languages: str,
+    github_token: str = "",
     server_secret: str = "",
     difficulty: str = "beginner",
     count: int = 10,
@@ -778,13 +802,16 @@ async def find_issues(
     Use recommend_issues() for issues auto-matched to YOUR skill profile.
 
     Args:
-        github_token:  Your GitHub Personal Access Token.
         languages:     Comma-separated (e.g. 'Python,JavaScript')
-        server_secret: The SERVER_SECRET from the server operator.
+        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
+        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
         difficulty:    'beginner', 'intermediate', or 'advanced'
         count:         Results to return (max 30)
         min_stars:     Minimum repo stars
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
@@ -837,8 +864,8 @@ async def find_issues(
 
 @mcp.tool()
 async def search_repos(
-    github_token: str,
     query: str,
+    github_token: str = "",
     server_secret: str = "",
     language: str = "",
     min_stars: int = 100,
@@ -848,13 +875,16 @@ async def search_repos(
     Search GitHub for repositories to contribute to.
 
     Args:
-        github_token:  Your GitHub Personal Access Token.
         query:         Keywords (e.g. 'web framework', 'machine learning cli')
-        server_secret: The SERVER_SECRET from the server operator.
+        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
+        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
         language:      Filter by language (e.g. 'Python'). Empty = any.
         min_stars:     Minimum star count
         count:         Results to return (max 20)
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
@@ -902,7 +932,7 @@ async def search_repos(
 
 @mcp.tool()
 async def check_rate_limit(
-    github_token: str,
+    github_token: str = "",
     server_secret: str = "",
 ) -> dict:
     """
@@ -910,9 +940,12 @@ async def check_rate_limit(
     Call this if tools are returning rate limit errors.
 
     Args:
-        github_token:  Your GitHub Personal Access Token.
-        server_secret: The SERVER_SECRET from the server operator.
+        github_token:  Your GitHub Personal Access Token (auto-loaded from GITHUB_TOKEN env if set).
+        server_secret: The SERVER_SECRET from the server operator (auto-loaded from env if set).
     """
+    github_token  = github_token  or os.getenv("GITHUB_TOKEN", "")
+    server_secret = server_secret or os.getenv("SERVER_SECRET", "")
+
     if not _check_server_secret(server_secret):
         return _DENY_SECRET
 
