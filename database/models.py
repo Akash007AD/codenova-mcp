@@ -28,7 +28,7 @@ class Database:
             cls._client = MongoClient(uri)
             cls._db = cls._client["codenova"]
             cls._setup_indexes()
-            print("✅ MongoDB connected")
+            import sys; sys.stderr.write("[codenova] MongoDB connected\n")
         return cls._db
 
     @classmethod
@@ -68,7 +68,7 @@ class Database:
         db.contributions.create_index("issue_id")
         db.contributions.create_index([("user_id", 1), ("issue_id", 1)], unique=True)
 
-        print("✅ MongoDB indexes created")
+        import sys; sys.stderr.write("[codenova] MongoDB indexes created\n")
 
     @classmethod
     def close(cls):

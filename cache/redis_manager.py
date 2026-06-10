@@ -67,14 +67,13 @@ class CacheManager:
                 decode_responses=True,
                 socket_connect_timeout=5,
                 socket_timeout=5,
-                protocol=2
             )
 
             try:
                 cls._client.ping()
-                print("✅ Redis connected")
+                import sys; sys.stderr.write("[codenova] Redis connected\n")
             except redis.ConnectionError:
-                print("⚠️  Redis not available — caching disabled")
+                import sys; sys.stderr.write("[codenova] Redis not available — caching disabled\n")
                 cls._client = None
 
         return cls._client
@@ -101,7 +100,7 @@ class CacheManager:
                 return json.loads(value)
             return None
         except Exception as e:
-            print(f"⚠️  Cache GET error [{key}]: {e}")
+            import sys; sys.stderr.write(f"[codenova] Cache GET error [{key}]: {e}\n")
             return None
 
     @classmethod
@@ -115,7 +114,7 @@ class CacheManager:
             client.setex(key, ttl, serialized)
             return True
         except Exception as e:
-            print(f"⚠️  Cache SET error [{key}]: {e}")
+            import sys; sys.stderr.write(f"[codenova] Cache SET error [{key}]: {e}\n")
             return False
 
     @classmethod
@@ -127,7 +126,7 @@ class CacheManager:
         try:
             client.delete(key)
         except Exception as e:
-            print(f"⚠️  Cache DELETE error [{key}]: {e}")
+            import sys; sys.stderr.write(f"[codenova] Cache DELETE error [{key}]: {e}\n")
 
     @classmethod
     def delete_pattern(cls, pattern: str):
@@ -139,9 +138,9 @@ class CacheManager:
             keys = client.keys(pattern)
             if keys:
                 client.delete(*keys)
-                print(f"🗑️  Cleared {len(keys)} cache keys matching [{pattern}]")
+                import sys; sys.stderr.write(f"[codenova] Cleared {len(keys)} cache keys matching [{pattern}]\n")
         except Exception as e:
-            print(f"⚠️  Cache pattern delete error [{pattern}]: {e}")
+            import sys; sys.stderr.write(f"[codenova] Cache pattern delete error [{pattern}]: {e}\n")
 
     @classmethod
     def exists(cls, key: str) -> bool:
