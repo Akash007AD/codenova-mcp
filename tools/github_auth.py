@@ -131,7 +131,8 @@ async def fetch_github_repos(access_token: str, per_page: int = 100) -> list:
                 f"https://api.github.com/user/repos",
                 headers={
                     "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/vnd.github+json"
+                    # mercy-preview header is required to get topics in the repo list
+                    "Accept": "application/vnd.github.mercy-preview+json"
                 },
                 params={
                     "per_page": per_page,
@@ -193,32 +194,123 @@ async def verify_pr_on_github(access_token: str, owner: str, repo: str, pr_numbe
 # Skill Extraction from GitHub Repos
 # ------------------------------------------------
 
-def extract_skills_from_repos(repos: list) -> dict:
-    """
-    Analyze user's GitHub repos and extract skill profile.
-    Language confidence = (repos using it / total repos) * 100
-    """
-    total = len(repos)
-    if total == 0:
-        return {},[]
+# Map GitHub repo topics → CodeNova interest categories
+TOPIC_TO_INTEREST = {
+    # web
+    "react": "web", "vue": "web", "angular": "web", "nextjs": "web",
+    "html": "web", "css": "web", "frontend": "frontend", "web": "web",
+    "django": "web", "flask": "web", "fastapi": "web", "express": "web",
+    # backend
+    "backend": "backend", "api": "backend", "rest-api": "backend",
+    "graphql": "backend", "microservices": "backend",
+    # ml / data
+    "machine-learning": "ml", "deep-learning": "ml", "neural-network": "ml",
+    "tensorflow": "ml", "pytorch": "ml", "sklearn": "ml", "nlp": "ml",
+    "data-science": "data", "pandas": "data", "numpy": "data",
+    "jupyter": "data", "visualization": "data",
+    # devtools / infra / cloud
+    "docker": "infra", "kubernetes": "infra", "devops": "infra",
+    "ci-cd": "infra", "terraform": "infra", "ansible": "infra",
+    "aws": "cloud", "gcp": "cloud", "azure": "cloud", "cloud": "cloud",
+    "linux": "infra", "bash": "cli", "shell": "cli", "cli": "cli",
+    # embedded / iot
+    "esp32": "embedded", "arduino": "embedded", "raspberry-pi": "embedded",
+    "iot": "embedded", "embedded": "embedded", "firmware": "embedded",
+    "lora": "embedded", "rtos": "embedded",
+    # security
+    "security": "security", "cryptography": "security", "cybersecurity": "security",
+    # networking
+    "networking": "networking", "protocol": "networking", "socket": "networking",
+    # mobile
+    "android": "mobile", "ios": "mobile", "flutter": "mobile", "react-native": "mobile",
+    # database
+    "database": "database", "mongodb": "database", "postgresql": "database",
+    "redis": "database", "sql": "database",
+    # testing / docs
+    "testing": "testing", "docs": "docs", "documentation": "docs",
+}
 
-    language_counts = {}
-    topic_set = set()
+
+def extract_skills_from_repos(repos: list) -> tuple:
+    """
+    Analyze user's public GitHub repos and extract a skill profile.
+
+    Scoring:
+      - Each repo contributes its primary language
+      - Repos with more stars get a slight weight boost
+      - Language score = weighted share * 100, capped at 95
+      - Topics are mapped to interest categories
+      - Fallback: if primary language is None but repo name hints at a
+        language (e.g. "-py", "-js"), we infer it
+    """
+    if not repos:
+        return {}, []
+
+    language_weights: dict = {}
+    interest_set: set = set()
+    total_weight = 0
 
     for repo in repos:
-        # Count language
+        # Weight = 1 base + small star bonus (log scale so one big repo
+        # doesn't dominate everything)
+        stars  = repo.get("stargazers_count", 0) or 0
+        weight = 1 + min(stars * 0.1, 3)   # max +3 bonus from stars
+        total_weight += weight
+
+        # Primary language from GitHub
         lang = repo.get("language")
+
+        # Fallback: infer from repo name if language is null
+        if not lang:
+            name = (repo.get("name") or "").lower()
+            desc = (repo.get("description") or "").lower()
+            text = name + " " + desc
+            if any(k in text for k in ("-py", "_py", "python", ".py")):
+                lang = "Python"
+            elif any(k in text for k in ("-js", "javascript", "nodejs", "node-", "react")):
+                lang = "JavaScript"
+            elif any(k in text for k in ("typescript", "-ts", "_ts")):
+                lang = "TypeScript"
+            elif any(k in text for k in ("rust", "-rs")):
+                lang = "Rust"
+            elif any(k in text for k in ("golang", "-go", "_go")):
+                lang = "Go"
+            elif any(k in text for k in ("cpp", "c++", "-cpp")):
+                lang = "C++"
+            elif any(k in text for k in ("arduino", "esp32", "firmware", "embedded")):
+                lang = "C"
+            elif any(k in text for k in ("java",)):
+                lang = "Java"
+            elif any(k in text for k in ("shell", "bash", ".sh")):
+                lang = "Shell"
+
         if lang:
-            language_counts[lang] = language_counts.get(lang, 0) + 1
+            language_weights[lang] = language_weights.get(lang, 0) + weight
 
-        # Collect topics for interest matching
-        topics = repo.get("topics", [])
-        topic_set.update(topics)
+        # Topics → interests
+        for topic in (repo.get("topics") or []):
+            t = topic.lower().strip()
+            mapped = TOPIC_TO_INTEREST.get(t)
+            if mapped:
+                interest_set.add(mapped)
+            # Also add the raw topic if it matches a known interest directly
+            known_interests = {
+                "web", "cli", "backend", "frontend", "devtools", "ml", "data",
+                "networking", "security", "embedded", "mobile", "cloud",
+                "infra", "docs", "testing", "compiler", "database", "gamedev",
+                "graphics", "crypto"
+            }
+            if t in known_interests:
+                interest_set.add(t)
 
-    # Convert to confidence scores (0-100)
-    skills = {
-        lang: round((count / total) * 100)
-        for lang, count in language_counts.items()
-    }
+    # Convert weights to 0-95 confidence scores
+    skills = {}
+    if total_weight > 0:
+        for lang, w in language_weights.items():
+            score = round((w / total_weight) * 100)
+            skills[lang] = min(score, 95)   # cap at 95; 100 would mean only one language ever
 
-    return skills, list(topic_set)
+    # Sort by score descending, keep top 15
+    skills = dict(sorted(skills.items(), key=lambda x: x[1], reverse=True)[:15])
+
+    return skills, list(interest_set)
