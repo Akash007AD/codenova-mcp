@@ -365,9 +365,10 @@ _BAD_TOKEN = {
     ),
 }
 
-# TTL for search result caches (seconds)
-_TTL_ISSUES = 60 * 60       # 1 hour — issues don't change that fast
-_TTL_RECS   = 60 * 60       # 1 hour
+# TTL constants (seconds)
+_TTL_ISSUES  = 60 * 60   # 1 hour
+_TTL_RECS    = 60 * 60   # 1 hour
+_TTL_REPOS   = 60 * 60   # 1 hour — new: search_repos cache TTL
 
 
 # =====================================================
@@ -376,8 +377,8 @@ _TTL_RECS   = 60 * 60       # 1 hour
 
 async def _search_issues_cached(
     cache_key: str,
-    queries: list[str],       # list of GitHub search query strings
-    lang_tag: list[str],      # parallel list: language label per query
+    queries: list[str],
+    lang_tag: list[str],
     ttl: int = _TTL_ISSUES,
 ) -> tuple[list, bool]:
     """
@@ -387,7 +388,6 @@ async def _search_issues_cached(
     If rate-limited and cache is empty, returns ([], False).
     If rate-limited but stale cache exists, returns (stale_list, True).
     """
-    # --- Cache read ---
     cached = _cache_get(cache_key)
     if cached is not None:
         sys.stderr.write(f"[codenova] Search cache HIT: {cache_key}\n")
@@ -433,11 +433,8 @@ async def _search_issues_cached(
                 })
 
     if rate_limited and not all_issues:
-        # Complete miss — nothing fetched before the rate limit hit.
-        # Return empty so callers can surface a clear error.
         return [], False
 
-    # Cache whatever we managed to get (even partial results from before rate-limit)
     if all_issues:
         _cache_set(cache_key, all_issues, ttl)
 
@@ -501,8 +498,6 @@ async def get_my_profile() -> dict:
         sys.stderr.write(f"[codenova] repo fetch warn: {e}\n")
 
     skills, interests = _extract_skills(repos)
-    # Only cache if we actually got skill data — prevents poisoning the cache
-    # with an empty dict when the repo fetch returned nothing useful.
     if skills:
         _db_save_profile(github_id, login, user, skills, interests)
     else:
@@ -546,8 +541,9 @@ async def recommend_issues(
 ) -> dict:
     """
     Full pipeline: loads your skills then finds matching open GitHub issues.
-    Results are cached for 1 hour to avoid GitHub Search API rate limits (30 req/min).
-    This is the main 'help me contribute' tool.
+    Checks the pre-indexed MongoDB issue cache first (zero Search API calls).
+    Falls back to GitHub Search API only when the DB index is empty.
+    Results are cached for 1 hour.
 
     Args:
         difficulty: 'beginner', 'intermediate', 'advanced', or 'auto'
@@ -571,19 +567,69 @@ async def recommend_issues(
         difficulty = profile.get("recommended_difficulty", "beginner")
 
     top_langs = list(skills.keys())[:2] or ["Python", "JavaScript"]
-    label = "good first issue" if difficulty == "beginner" else "help wanted"
 
-    # Build a stable cache key: user + difficulty + their top languages
-    langs_key  = "_".join(sorted(top_langs))
-    cache_key  = f"codenova:recs:{user['id']}:{difficulty}:{langs_key}"
+    # ── Step 1: Try pre-indexed MongoDB issues (zero Search API calls) ──────
+    # The background scheduler (jobs/scheduler.py) fills db.issues every 3 hours.
+    # If we get enough matches there, we skip the Search API entirely.
+    issues: list = []
+    from_cache   = False
+    source       = "search_api"
 
-    queries  = [
-        f'label:"{label}" language:{lang} stars:>50 is:open is:issue no:assignee'
-        for lang in top_langs
-    ]
-    lang_tags = top_langs
+    if _db is not None:
+        try:
+            from database.models import IssueModel
+            issue_model = IssueModel()
+            db_issues   = issue_model.get_active_issues(
+                difficulty=difficulty,
+                languages=top_langs,
+                limit=100,
+            )
+            if db_issues:
+                for doc in db_issues:
+                    # Normalise MongoDB doc shape → same dict shape as _search_issues_cached
+                    updated_raw = doc.get("updated_at")
+                    if isinstance(updated_raw, str):
+                        updated_str = updated_raw[:10]
+                    elif updated_raw:
+                        updated_str = updated_raw.strftime("%Y-%m-%d")
+                    else:
+                        updated_str = ""
+                    issues.append({
+                        "title":        doc.get("title", ""),
+                        "url":          doc.get("issue_url", ""),
+                        "repo":         doc.get("repo", ""),
+                        "repo_url":     doc.get("repo_url", ""),
+                        "language":     (doc.get("languages") or [""])[0],
+                        "difficulty":   doc.get("difficulty", difficulty),
+                        "labels":       doc.get("labels", []),
+                        "comments":     doc.get("comments", 0),
+                        "updated_at":   updated_str,
+                        "body_preview": (doc.get("description") or "")[:300].strip(),
+                    })
+                from_cache = True
+                source     = "db_index"
+                sys.stderr.write(
+                    f"[codenova] recommend_issues: {len(issues)} issues from "
+                    f"db.issues (no Search API call)\n"
+                )
+        except Exception as _db_err:
+            sys.stderr.write(
+                f"[codenova] db.issues lookup failed, falling back to Search API: {_db_err}\n"
+            )
 
-    issues, from_cache = await _search_issues_cached(cache_key, queries, lang_tags, ttl=_TTL_RECS)
+    # ── Step 2: Fall back to GitHub Search API if DB had nothing ────────────
+    if not issues:
+        label     = "good first issue" if difficulty == "beginner" else "help wanted"
+        langs_key = "_".join(sorted(top_langs))
+        cache_key = f"codenova:recs:{user['id']}:{difficulty}:{langs_key}"
+        queries   = [
+            f'label:"{label}" language:{lang} stars:>50 is:open is:issue no:assignee'
+            for lang in top_langs
+        ]
+        issues, from_cache = await _search_issues_cached(
+            cache_key, queries, top_langs, ttl=_TTL_RECS
+        )
+        source = "search_api_cache" if from_cache else "search_api_live"
 
     if not issues and not from_cache:
         return {
@@ -620,7 +666,7 @@ async def recommend_issues(
         "skill_summary": {k: v for k, v in list(skills.items())[:6]},
         "count":         len(issues[:count]),
         "issues":        issues[:count],
-        "cached":        from_cache,
+        "source":        source,
         "next_step":     "Call get_issue_details(url) on any issue, then explain_code_file() before editing.",
     }
 
@@ -706,6 +752,8 @@ async def explain_code_file(
 ) -> dict:
     """
     Fetch a source file from GitHub and explain it for a first-time contributor.
+    Checks the MongoDB explanation cache first — if this file was explained before,
+    the cached explanation is returned instantly without calling Groq.
 
     Args:
         repo_full_name: 'owner/repo' (e.g. 'django/django')
@@ -722,9 +770,40 @@ async def explain_code_file(
     if "/" not in repo_full_name:
         return {"error": "Use 'owner/repo' format."}
 
+    # ── Step 1: Check ExplanationModel cache in MongoDB ─────────────────────
+    # Explanations are stable — the same file rarely needs re-explaining.
+    # Cache key is the full path so different repos never collide.
+    exp_cache_key = f"{repo_full_name}/{file_path}"
+    if _db is not None:
+        try:
+            from database.models import ExplanationModel
+            exp_model   = ExplanationModel()
+            cached_exp  = exp_model.get(exp_cache_key)
+            if cached_exp:
+                exp_model.increment_used(exp_cache_key)
+                sys.stderr.write(
+                    f"[codenova] explain_code_file: cache HIT for '{exp_cache_key}' "
+                    f"(used {cached_exp.get('used_count', 0) + 1}x, no Groq call)\n"
+                )
+                return {
+                    "file":              file_path,
+                    "repo":              repo_full_name,
+                    "source":            "db_cache",
+                    "explanation":       cached_exp.get("explanation", ""),
+                    "key_concepts":      cached_exp.get("key_concepts", ""),
+                    "modification_tips": cached_exp.get("modification_tips", ""),
+                    # Don't re-serve full_source from cache — re-fetch so it's current
+                    "full_source":       "",
+                }
+        except Exception as _exp_err:
+            sys.stderr.write(
+                f"[codenova] ExplanationModel lookup failed, proceeding to Groq: {_exp_err}\n"
+            )
+
+    # ── Step 2: Fetch source from GitHub ────────────────────────────────────
     default_branch = "main"
     try:
-        repo_info = await _gh_get(f"https://api.github.com/repos/{repo_full_name}")
+        repo_info      = await _gh_get(f"https://api.github.com/repos/{repo_full_name}")
         default_branch = repo_info.get("default_branch", "main")
     except Exception:
         pass
@@ -746,6 +825,7 @@ async def explain_code_file(
     line_count  = len(lines)
     content_llm = "\n".join(lines[:400])
 
+    # ── Step 3: Call Groq and parse structured output ───────────────────────
     explanation = key_concepts = modification_tips = ""
 
     if GROQ_API_KEY:
@@ -763,8 +843,8 @@ async def explain_code_file(
             current = None
             for line in raw.split("\n"):
                 up = line.strip().upper()
-                if "WHAT IT DOES"   in up: current = "w"
-                elif "KEY CONCEPTS" in up: current = "k"
+                if "WHAT IT DOES"    in up: current = "w"
+                elif "KEY CONCEPTS"  in up: current = "k"
                 elif "WHERE TO LOOK" in up: current = "t"
                 elif current == "w" and line.strip(): explanation       += line + "\n"
                 elif current == "k" and line.strip(): key_concepts      += line + "\n"
@@ -774,14 +854,36 @@ async def explain_code_file(
     else:
         explanation = "GROQ_API_KEY not set in .env — AI explanations disabled."
 
+    explanation       = explanation.strip()
+    key_concepts      = key_concepts.strip()
+    modification_tips = modification_tips.strip()
+
+    # ── Step 4: Persist to ExplanationModel so future calls skip Groq ───────
+    if _db is not None and explanation and "LLM error" not in explanation:
+        try:
+            from database.models import ExplanationModel
+            ExplanationModel().save(
+                file_path      = exp_cache_key,
+                explanation    = explanation,
+                key_concepts   = key_concepts,
+                modification_tips = modification_tips,
+            )
+            sys.stderr.write(
+                f"[codenova] explain_code_file: saved explanation for "
+                f"'{exp_cache_key}' to MongoDB\n"
+            )
+        except Exception as _save_err:
+            sys.stderr.write(f"[codenova] ExplanationModel save failed: {_save_err}\n")
+
     return {
         "file":              file_path,
         "repo":              repo_full_name,
         "lines":             line_count,
         "truncated":         line_count > 400,
-        "explanation":       explanation.strip(),
-        "key_concepts":      key_concepts.strip(),
-        "modification_tips": modification_tips.strip(),
+        "source":            "groq_live",
+        "explanation":       explanation,
+        "key_concepts":      key_concepts,
+        "modification_tips": modification_tips,
         "full_source":       content if line_count <= 150 else content_llm,
     }
 
@@ -898,7 +1000,6 @@ async def find_issues(
 
     label = "good first issue" if difficulty == "beginner" else "help wanted"
 
-    # Stable cache key: difficulty + sorted languages + min_stars
     langs_key = "_".join(sorted(lang_list[:5]))
     cache_key = f"codenova:issues:{difficulty}:{langs_key}:s{min_stars}"
 
@@ -941,6 +1042,7 @@ async def search_repos(
 ) -> dict:
     """
     Search GitHub for repositories to contribute to.
+    Results are cached for 1 hour to avoid hammering the Search API.
 
     Args:
         query:     Keywords (e.g. 'web framework', 'machine learning cli')
@@ -955,6 +1057,20 @@ async def search_repos(
     if not user:
         return _BAD_TOKEN
 
+    count = min(count, 20)
+
+    # ── Cache key: stable hash of (query, language, min_stars, count) ───────
+    safe_query = re.sub(r"[^a-zA-Z0-9_]", "_", query)[:60]
+    safe_lang  = re.sub(r"[^a-zA-Z0-9]", "", language)[:20]
+    cache_key  = f"codenova:repos:{safe_query}:{safe_lang}:s{min_stars}:n{count}"
+
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        sys.stderr.write(f"[codenova] search_repos cache HIT: {cache_key}\n")
+        return {**cached, "cached": True}
+
+    sys.stderr.write(f"[codenova] search_repos cache MISS: {cache_key} — querying GitHub\n")
+
     q = f"{query} stars:>{min_stars} is:public archived:false"
     if language:
         q += f" language:{language}"
@@ -962,17 +1078,21 @@ async def search_repos(
     try:
         data = await _gh_get(
             "https://api.github.com/search/repositories",
-            {"q": q, "sort": "stars", "order": "desc", "per_page": min(count, 20)},
+            {"q": q, "sort": "stars", "order": "desc", "per_page": count},
         )
     except httpx.HTTPStatusError as e:
         if e.response.status_code in (403, 429):
-            return {"error": "GitHub rate limit hit. Wait ~1 minute and try again."}
+            return {
+                "error": "github_search_rate_limited",
+                "message": "GitHub Search API rate limit hit. Wait ~60 seconds and try again.",
+            }
         return {"error": f"GitHub API error {e.response.status_code}"}
 
-    return {
-        "query": query,
-        "count": len(data.get("items", [])),
-        "repos": [
+    result = {
+        "query":  query,
+        "count":  len(data.get("items", [])),
+        "cached": False,
+        "repos":  [
             {
                 "name":        r["full_name"],
                 "description": r.get("description", ""),
@@ -990,6 +1110,11 @@ async def search_repos(
             for r in data.get("items", [])[:count]
         ],
     }
+
+    # Cache the result (without the cached flag — we set that on read)
+    _cache_set(cache_key, result, _TTL_REPOS)
+
+    return result
 
 
 @mcp.tool()
@@ -1048,7 +1173,6 @@ async def clear_profile_cache() -> dict:
     login     = user["login"]
     cleared   = []
 
-    # Clear MongoDB profile
     if _db is not None:
         try:
             result = _db.users.delete_one({"github_id": github_id})
@@ -1058,17 +1182,16 @@ async def clear_profile_cache() -> dict:
         except Exception as e:
             sys.stderr.write(f"[codenova] MongoDB clear error: {e}\n")
 
-    # Clear whoami key + all recommendations for this user
     whoami_key = f"codenova:whoami:{GITHUB_TOKEN[:16]}"
     _cache_delete(whoami_key)
     _cache_delete_prefix(f"codenova:recs:{user['id']}:")
     cleared.append("search/recommendation cache (Redis + memory)")
 
     return {
-        "status":  "cleared",
+        "status":   "cleared",
         "username": login,
-        "cleared": cleared,
-        "message": (
+        "cleared":  cleared,
+        "message":  (
             f"Cache cleared for '{login}'. "
             "Call get_my_profile() to rebuild with fresh data."
         ),
