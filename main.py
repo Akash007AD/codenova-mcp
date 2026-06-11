@@ -31,6 +31,14 @@ from fastapi.responses import JSONResponse
 # Import the shared MCP instance (all tools already registered in server.py)
 from server import mcp, GROQ_API_KEY, _db
 
+# ── Scheduler: index issues on startup + refresh every 3 hours ──────────────
+from jobs.scheduler import create_scheduler, run_initial_indexing
+
+_scheduler = create_scheduler()
+_scheduler.start()
+run_initial_indexing()   # fills db.issues immediately if count < 100
+# ────────────────────────────────────────────────────────────────────────────
+
 # =====================================================
 # FastAPI app
 # =====================================================

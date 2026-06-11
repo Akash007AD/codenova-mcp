@@ -57,37 +57,50 @@ def index_github_issues():
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
+    # FIX: Use 'good first issue' (spaces, quoted) — not 'good-first-issue' (hyphen).
+    # The hyphen variant returns ~3 results; the space variant returns 1000+.
+    # stars:>10 keeps quality repos while maximising coverage vs stars:>50.
     search_queries = [
-        ('label:good-first-issue language:JavaScript stars:>50 is:open is:issue', "JavaScript"),
-        ('label:good-first-issue language:Python stars:>50 is:open is:issue',     "Python"),
-        ('label:good-first-issue language:TypeScript stars:>50 is:open is:issue', "TypeScript"),
-        ('label:good-first-issue language:Java stars:>50 is:open is:issue',       "Java"),
-        ('label:good-first-issue language:Go stars:>50 is:open is:issue',         "Go"),
-        ('label:good-first-issue language:Rust stars:>50 is:open is:issue',       "Rust"),
-        ('label:good-first-issue language:C++ stars:>50 is:open is:issue',        "C++"),
-        ('label:good-first-issue language:HTML stars:>50 is:open is:issue',       "HTML"),
+        ('label:"good first issue" language:JavaScript stars:>10 is:open is:issue', "JavaScript"),
+        ('label:"good first issue" language:Python stars:>10 is:open is:issue',     "Python"),
+        ('label:"good first issue" language:TypeScript stars:>10 is:open is:issue', "TypeScript"),
+        ('label:"good first issue" language:Java stars:>10 is:open is:issue',       "Java"),
+        ('label:"good first issue" language:Go stars:>10 is:open is:issue',         "Go"),
+        ('label:"good first issue" language:Rust stars:>10 is:open is:issue',       "Rust"),
+        ('label:"good first issue" language:C++ stars:>10 is:open is:issue',        "C++"),
+        ('label:"good first issue" language:HTML stars:>10 is:open is:issue',       "HTML"),
     ]
 
-    total_indexed = 0
+    total_queries  = 0
+    total_inserted = 0
     for query, language in search_queries:
         try:
-            _index_query(query, headers, issue_model, language)
-            total_indexed += 1
+            inserted = _index_query(query, headers, issue_model, language)
+            total_queries  += 1
+            total_inserted += inserted
         except Exception as e:
-            sys.stderr.write(f"[codenova] Query failed [{query[:50]}...]: {e}\n")
+            sys.stderr.write(f"[codenova] Query failed [{query[:60]}...]: {e}\n")
 
-    # Invalidate Redis caches so the next request recomputes recommendations
+    # Invalidate Redis caches so next request re-scores from fresh DB data
     try:
         CacheManager.invalidate_issues()
     except Exception:
         pass
 
-    sys.stderr.write(f"[codenova] Issue indexing complete — {total_indexed} queries processed\n")
+    sys.stderr.write(
+        f"[codenova] Issue indexing complete — "
+        f"{total_queries} language queries, {total_inserted} issues upserted\n"
+    )
 
 
-def _index_query(query: str, headers: dict, issue_model, primary_language: str = ""):
-    """Fetch and upsert issues for a single search query."""
+def _index_query(query: str, headers: dict, issue_model, primary_language: str = "") -> int:
+    """
+    Fetch and upsert issues for a single search query.
+    Returns the number of issues upserted.
+    """
     from tools.matching import estimate_difficulty
+
+    total_upserted = 0
 
     with httpx.Client(timeout=30) as client:
         for page in range(1, 4):   # 3 pages × 100 = up to 300 per language
@@ -104,8 +117,9 @@ def _index_query(query: str, headers: dict, issue_model, primary_language: str =
             )
 
             if response.status_code == 422:
+                sys.stderr.write(f"[codenova] 422 Unprocessable for query: {query[:60]}\n")
                 break
-            if response.status_code == 403:
+            if response.status_code in (403, 429):
                 sys.stderr.write("[codenova] GitHub rate limit hit — stopping indexing\n")
                 break
 
@@ -116,35 +130,42 @@ def _index_query(query: str, headers: dict, issue_model, primary_language: str =
 
             issues_to_upsert = []
             for item in items:
-                labels = [lb["name"] for lb in item.get("labels", [])]
+                labels    = [lb["name"] for lb in item.get("labels", [])]
                 languages = _extract_languages_from_issue(item, primary_language)
 
                 issues_to_upsert.append({
-                    "github_id":        item["id"],
-                    "title":            item["title"],
-                    "description":      (item.get("body") or "")[:2000],
-                    "issue_url":        item["html_url"],
-                    "repo":             item["repository_url"].split("/repos/")[-1],
-                    "repo_url":         item["repository_url"].replace(
-                                            "https://api.github.com/repos/",
-                                            "https://github.com/"),
-                    "difficulty":       estimate_difficulty(labels),
-                    "labels":           labels,
-                    "languages":        languages,
-                    "stars":            0,
+                    "github_id":         item["id"],
+                    "title":             item["title"],
+                    "description":       (item.get("body") or "")[:2000],
+                    "issue_url":         item["html_url"],
+                    "repo":              item["repository_url"].split("/repos/")[-1],
+                    "repo_url":          item["repository_url"].replace(
+                                             "https://api.github.com/repos/",
+                                             "https://github.com/"),
+                    "difficulty":        estimate_difficulty(labels),
+                    "labels":            labels,
+                    "languages":         languages,
+                    "stars":             0,
                     "open_issues_count": 0,
-                    "comments":         item.get("comments", 0),
-                    "created_at":       item.get("created_at"),
-                    "updated_at":       item.get("updated_at"),
-                    "indexed_at":       datetime.utcnow(),
-                    "expires_at":       datetime.utcnow() + timedelta(days=30),
+                    "comments":          item.get("comments", 0),
+                    "created_at":        item.get("created_at"),
+                    "updated_at":        item.get("updated_at"),
+                    "indexed_at":        datetime.utcnow(),
+                    "expires_at":        datetime.utcnow() + timedelta(days=30),
                 })
 
             if issues_to_upsert:
                 issue_model.bulk_upsert(issues_to_upsert)
+                total_upserted += len(issues_to_upsert)
+                sys.stderr.write(
+                    f"[codenova]   {primary_language:12} page {page}: "
+                    f"upserted {len(issues_to_upsert)} issues\n"
+                )
 
             if len(items) < 100:
                 break
+
+    return total_upserted
 
 
 def _extract_languages_from_issue(item: dict, primary_language: str = "") -> list:
@@ -204,11 +225,11 @@ def prewarm_explanation_cache():
             continue
         if not CacheManager.get_explanation(file_path):
             CacheManager.cache_explanation(file_path, {
-                "file_path":        file_path,
-                "explanation":      exp.get("explanation"),
-                "key_concepts":     exp.get("key_concepts"),
+                "file_path":         file_path,
+                "explanation":       exp.get("explanation"),
+                "key_concepts":      exp.get("key_concepts"),
                 "modification_tips": exp.get("modification_tips"),
-                "cached_at":        datetime.utcnow().isoformat(),
+                "cached_at":         datetime.utcnow().isoformat(),
             })
             restored += 1
 
@@ -239,8 +260,8 @@ def create_scheduler() -> BackgroundScheduler:
     """Create and configure APScheduler. Returns the scheduler (not started)."""
     scheduler = BackgroundScheduler(
         job_defaults={
-            "coalesce":          True,
-            "max_instances":     1,
+            "coalesce":           True,
+            "max_instances":      1,
             "misfire_grace_time": 300,
         }
     )
